@@ -1,0 +1,6 @@
+build/
+__pycache__/
+*.pyc
+tests/unit/*.exe
+firmware/picocalc_studio/src/app/*
+!firmware/picocalc_studio/src/app/.keep

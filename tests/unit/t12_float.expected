@@ -1,0 +1,13 @@
+ops 2.2500 4.7500 -4.3750 -2.8000
+cmp 1 0 1 0
+lerp 12.500
+sum9 45.0
+mixed 4.00
+abs 1.25 sqrt 1.41421
+trunc 3 -3
+u2f 4000000000.0 i2f -123456.0
+f2u 3
+f2uc 200
+harmonic 5.1874
+array 5.00 3.50
+compound 1.750

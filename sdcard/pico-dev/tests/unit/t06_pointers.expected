@@ -1,0 +1,15 @@
+idx 1 3 5
+move 4 3
+diff 3
+cmp 1 1
+walk 15
+bumped 101 105
+pp 10 20
+2d 23 12 138
+rowsize 48 16
+rowptr 13
+stride 6 3
+void 102
+strs two o
+null 1
+endian 44 11

@@ -1,0 +1,30 @@
+#include "chibicc.h"
+
+void strarray_push(StringArray *arr, char *s) {
+  if (!arr->data) {
+    arr->data = calloc(8, sizeof(char *));
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = cc_realloc(arr->data, sizeof(char *) * arr->capacity,
+                           sizeof(char *) * arr->capacity * 2);
+    arr->capacity *= 2;
+  }
+
+  arr->data[arr->len++] = s;
+}
+
+// Takes a printf-style format string and returns a formatted string.
+char *format(char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(NULL, 0, fmt, ap);
+  va_end(ap);
+
+  char *buf = calloc(1, len + 1);
+  va_start(ap, fmt);
+  vsnprintf(buf, len + 1, fmt, ap);
+  va_end(ap);
+  return buf;
+}

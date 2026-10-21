@@ -1,0 +1,13 @@
+square 49 9
+max 9
+str hello world 3 a + b
+cat 5
+feature on
+helper 42 42
+line 53
+[log] 1-x
+[log0] no args
+self 2
+empty 3
+multi 100
+builtin 1

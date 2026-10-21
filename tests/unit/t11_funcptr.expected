@@ -1,0 +1,7 @@
++=17 -=7 *=60 M=12 
+pick 42 null 1
+sorted -50 -3 0 8 17 23 42 99
+bsearch 17 idx 4
+words apple banana fig pear
+fold 136 99
+arrfp 5 36

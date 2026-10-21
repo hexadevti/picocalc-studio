@@ -1,0 +1,10 @@
+pun DCBA size 4
+float bits 3f800000
+enum 0 1 10 11 -3 -2
+enum inc 12 size 4
+switch 1
+int 42
+float 3.25
+str text
+typedef fp 42
+halves 7 5

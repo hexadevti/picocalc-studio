@@ -1,0 +1,18 @@
+signedness 200 -56 1
+escapes [a	b] 10 0 65 65
+quote "q" \ '
+concat concatenated
+sizeof 4 4
+cpy Hello, PicoCalc len 15 15
+cmp 1 1 0
+ncmp 0
+chr , PicoCalc
+rchr /c.txt
+str PicoCalc
+mem XYXYZ---------- 1
+rev desserts
+ctype 2 4 2 Q q
+atoi -1234 255 511
+snprintf id-007 6
+trunc trun 9
+arrsize 6

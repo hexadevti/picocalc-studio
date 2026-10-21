@@ -1,0 +1,11 @@
+sizes 12 16 16 2 8 20 4
+offs 4 8 8 8 16
+nested T x 123456 -7 3 0
+bits 5 17 1000 -20 raw 00b3e88d
+bits2 1 1001
+small 100 -50 70000 70050
+large 75 10 15
+vec 1.000 6.250
+fi 10.00 12
+pts 11 106 13 102
+designated 8 9

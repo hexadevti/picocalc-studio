@@ -1,0 +1,12 @@
+s 1 0 1 1 1 1
+u 0 1
+mixed 1
+chars 1 1 1
+and0 r=0 calls=1
+and1 r=1 calls=2
+or1 r=1 calls=1
+or0 r=0 calls=2
+not 1 0 1
+tern 10 20 1
+sum 2
+ll 1 1

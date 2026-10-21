@@ -1,0 +1,10 @@
+ints -42 42 abc 10 Z %
+width [   42] [42   ] [00042] [+42]
+str [pico] [    pico] [pico    ] [pic]
+float 3.141590 0.67   -1.500 0.3     |
+mixed 1 2.5 3 4.5 five 6000000000
+long -100000 4000000000
+sum 0 6 55
+avg 2.750
+i:7 d:1.25 s:txt l:1099511627776 c:q i:-1 
+vsn load=75 (75.0%) 15 15

@@ -1,0 +1,14 @@
+wrote 4096
+size 4096 at1000 232 last 255 eof 1
+sum 522240
+read[0] line 1
+read[1] second line
+read[2] values 42 1.50
+read[3] appended
+scan 2 values 42
+rename 0
+missing 1
+dir data.bin renamed.txt
+stat 0 size_ok 1 isdir 0
+remove 0 0
+gone 1

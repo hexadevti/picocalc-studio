@@ -1,0 +1,11 @@
+neg zero small big
+for 45
+while 105 15
+do 1
+brk 42
+nested 15
+dense -1 100 101 102 103 104 105 106 107 -1
+sparse 1 2 3 4 0
+fall 111 110 100 10 -1
+goto 5
+comma 5 5
