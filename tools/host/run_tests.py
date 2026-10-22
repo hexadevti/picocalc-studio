@@ -13,7 +13,7 @@ Modes
           (Validates the tests themselves; the same headers are later checked against pcc.)
   simref  Build every tests/unit/*.c with riscv32-esp-elf-gcc (-O1, rv32imafc/ilp32f, the real
           ESP newlib), link it with simfw and run it under rvsim (tools/host/rvsim); stdout must
-          match .expected byte for byte. TEST_DIR keeps its device default (/sd/pico-dev/tests/tmp),
+          match .expected byte for byte. TEST_DIR keeps its device default (/sd/pico-dev/tests/tmp_t18),
           served from a temporary --sd directory. Builds rvsim/simfw first if out of date.
   pcc     Run the PicoCalc compiler on every test: --pcc "<command with {src} {out}>" compiles,
           --exec "<command with {out}>" runs the module (device bridge or RV32 emulator).

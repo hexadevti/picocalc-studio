@@ -10,9 +10,9 @@
 // -1) gets a red background.
 void ed_draw(Doc *d, int y0, int rows, int errLine);
 
-// Applies a navigation or editing key (ui_key() code). False if the key isn't one. Alt (or Shift)+movement
+// Applies a navigation or editing key (ui_key() code). False if the key isn't one. Alt+movement
 // selects; Ctrl-A/C/X/V/Z/Y/K/D: select all, copy, cut, paste, undo, redo, delete line(s),
-// duplicate line(s). Ctrl-Space toggles mark mode.
+// duplicate line(s).
 bool ed_key(Doc *d, int key, int rows);
 
 // Mark mode on (selection starts at the cursor, movement extends it) or off (selection kept).

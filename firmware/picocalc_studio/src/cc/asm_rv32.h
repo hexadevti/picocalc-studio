@@ -11,6 +11,7 @@
 enum {
   ZERO = 0, RA = 1, SP = 2, GP = 3, TP = 4, T0 = 5, T1 = 6, T2 = 7, S0 = 8, S1 = 9,
   A0 = 10, A1, A2, A3, A4, A5, A6, A7,
+  S2 = 18, S11 = 27,
   T3 = 28, T4, T5, T6,
 };
 // Floating-point registers
@@ -29,6 +30,16 @@ void emit32(uint32_t insn);
 int asm_new_label(void);
 void asm_bind(int label);
 void asm_end_function(void);  // resolves fixups; errors if a label is unbound
+
+// Two-pass functions: asm_begin_function() marks the start; asm_rollback() discards everything
+// emitted since (text, labels, fixups, relocations) and starts the second pass, which uses the
+// first pass's label positions to emit short forward branches. The second pass must emit the
+// same branches and labels in the same order, with code that is nowhere longer.
+void asm_begin_function(void);
+void asm_rollback(void);
+
+// The last instruction, if it can be rewritten: nothing branches to the current pc.
+uint32_t *asm_last_insn(void);
 
 // Encoders
 void rv_r(int f7, int rs2, int rs1, int f3, int rd, int op);
@@ -75,6 +86,8 @@ void rv_label_addr(int rd, int label);  // rd = address of label (auipc + addi)
 
 // Symbol references (emit auipc+I-type pair with a CC_R_PAIR relocation)
 void rv_sym_addr(int rd, int sym, int32_t addend, int line);  // auipc rd; addi rd, rd
+// auipc rd only: the next instruction must be a load/store at offset 0 from rd.
+void rv_sym_hi(int rd, int sym, int32_t addend, int line);
 void rv_call_sym(int sym, int line);                         // auipc ra; jalr ra, ra
 
 // Patches an auipc + (I or S-type) pair at p for a pc-relative displacement.

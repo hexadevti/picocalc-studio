@@ -1,30 +1,30 @@
 #include "chibicc.h"
 
-Type *ty_void = &(Type){TY_VOID, 1, 1};
-Type *ty_bool = &(Type){TY_BOOL, 1, 1};
+Type *ty_void = &(Type){.kind = TY_VOID, .size = 1, .align = 1};
+Type *ty_bool = &(Type){.kind = TY_BOOL, .size = 1, .align = 1};
 
-Type *ty_char = &(Type){TY_CHAR, 1, 1};
-Type *ty_short = &(Type){TY_SHORT, 2, 2};
-Type *ty_int = &(Type){TY_INT, 4, 4};
-Type *ty_long = &(Type){TY_LONG, 8, 8};
+Type *ty_char = &(Type){.kind = TY_CHAR, .size = 1, .align = 1};
+Type *ty_short = &(Type){.kind = TY_SHORT, .size = 2, .align = 2};
+Type *ty_int = &(Type){.kind = TY_INT, .size = 4, .align = 4};
+Type *ty_long = &(Type){.kind = TY_LONG, .size = 8, .align = 8};
 
-Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
-Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
-Type *ty_uint = &(Type){TY_INT, 4, 4, true};
-Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
+Type *ty_uchar = &(Type){.kind = TY_CHAR, .size = 1, .align = 1, .is_unsigned = true};
+Type *ty_ushort = &(Type){.kind = TY_SHORT, .size = 2, .align = 2, .is_unsigned = true};
+Type *ty_uint = &(Type){.kind = TY_INT, .size = 4, .align = 4, .is_unsigned = true};
+Type *ty_ulong = &(Type){.kind = TY_LONG, .size = 8, .align = 8, .is_unsigned = true};
 
-Type *ty_float = &(Type){TY_FLOAT, 4, 4};
-Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
+Type *ty_float = &(Type){.kind = TY_FLOAT, .size = 4, .align = 4};
+Type *ty_double = &(Type){.kind = TY_DOUBLE, .size = 8, .align = 8};
 // long double is the same as double on this target (the RISC-V ABI says 16-byte quad;
 // we do not support quad precision).
-Type *ty_ldouble = &(Type){TY_DOUBLE, 8, 8};
+Type *ty_ldouble = &(Type){.kind = TY_DOUBLE, .size = 8, .align = 8};
 
 // `long` is 32 bits and maps to the int types; TY_LONG is `long long`.
-Type *ty_size_t = &(Type){TY_INT, 4, 4, true};
-Type *ty_ptrdiff_t = &(Type){TY_INT, 4, 4};
+Type *ty_size_t = &(Type){.kind = TY_INT, .size = 4, .align = 4, .is_unsigned = true};
+Type *ty_ptrdiff_t = &(Type){.kind = TY_INT, .size = 4, .align = 4};
 
 static Type *new_type(TypeKind kind, int size, int align) {
-  Type *ty = calloc(1, sizeof(Type));
+  Type *ty = cc_type_calloc(sizeof(Type));
   ty->kind = kind;
   ty->size = size;
   ty->align = align;
@@ -94,10 +94,55 @@ bool is_compatible(Type *t1, Type *t2) {
 }
 
 Type *copy_type(Type *ty) {
-  Type *ret = calloc(1, sizeof(Type));
+  Type *ret = cc_type_calloc(sizeof(Type));
   *ret = *ty;
   ret->origin = ty;
   return ret;
+}
+
+// ty, or a copy in the main arena if it (or a type it is made of) is in the function arena: for
+// a global (a static local, a string literal) that outlives the function.
+Type *keep_type(Type *ty) {
+  if (!ty)
+    return NULL;
+  bool in_fn = cc_in_fn_arena(ty);
+  Type *base = keep_type(ty->base), *origin = keep_type(ty->origin);
+  Type *ret_ty = ty->kind == TY_FUNC ? keep_type(ty->return_ty) : NULL;
+  if (!in_fn && base == ty->base && origin == ty->origin &&
+      (ty->kind != TY_FUNC || ret_ty == ty->return_ty))
+    return ty;
+
+  bool was = cc_fn_types(false);
+  Type *t = calloc(1, sizeof(Type));
+  *t = *ty;
+  t->base = base;
+  t->origin = origin;
+  t->next = NULL;
+  if (ty->kind == TY_FUNC) {
+    t->return_ty = ret_ty;
+    Type head = {}, *cur = &head;
+    for (Type *p = ty->params; p; p = p->next) {
+      cur = cur->next = calloc(1, sizeof(Type));
+      Type *k = keep_type(p);
+      *cur = *k;
+      cur->next = NULL;
+    }
+    t->params = head.next;
+  } else if (ty->kind == TY_VLA) {
+    t->vla_len = NULL;
+    t->vla_size = NULL;
+  } else if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && in_fn) {
+    // A copy made for a flexible array member's initializer; its members are its own.
+    Member head = {}, *cur = &head;
+    for (Member *m = ty->members; m; m = m->next) {
+      cur = cur->next = calloc(1, sizeof(Member));
+      *cur = *m;
+      cur->ty = keep_type(m->ty);
+    }
+    t->members = head.next;
+  }
+  cc_fn_types(was);
+  return t;
 }
 
 Type *pointer_to(Type *base) {
@@ -175,8 +220,8 @@ static Type *get_common_type(Type *ty1, Type *ty2) {
 // This operation is called the "usual arithmetic conversion".
 static void usual_arith_conv(Node **lhs, Node **rhs) {
   Type *ty = get_common_type((*lhs)->ty, (*rhs)->ty);
-  *lhs = new_cast(*lhs, ty);
-  *rhs = new_cast(*rhs, ty);
+  *lhs = implicit_cast(*lhs, ty);
+  *rhs = implicit_cast(*rhs, ty);
 }
 
 void add_type(Node *node) {
@@ -185,16 +230,21 @@ void add_type(Node *node) {
 
   add_type(node->lhs);
   add_type(node->rhs);
-  add_type(node->cond);
-  add_type(node->then);
-  add_type(node->els);
-  add_type(node->init);
-  add_type(node->inc);
-
-  for (Node *n = node->body; n; n = n->next)
-    add_type(n);
-  for (Node *n = node->args; n; n = n->next)
-    add_type(n);
+  if (is_ctl_node(node)) {
+    add_type(node->cond);
+    add_type(node->then);
+    add_type(node->els);
+    if (node->kind == ND_FOR) {
+      add_type(node->init);
+      add_type(node->inc);
+    }
+  } else if (node->kind == ND_BLOCK || node->kind == ND_STMT_EXPR) {
+    for (Node *n = node->body; n; n = n->next)
+      add_type(n);
+  } else if (node->kind == ND_FUNCALL) {
+    for (Node *n = node->args; n; n = n->next)
+      add_type(n);
+  }
 
   switch (node->kind) {
   case ND_NUM:
@@ -213,7 +263,7 @@ void add_type(Node *node) {
     return;
   case ND_NEG: {
     Type *ty = get_common_type(ty_int, node->lhs->ty);
-    node->lhs = new_cast(node->lhs, ty);
+    node->lhs = implicit_cast(node->lhs, ty);
     node->ty = ty;
     return;
   }
@@ -221,7 +271,7 @@ void add_type(Node *node) {
     if (node->lhs->ty->kind == TY_ARRAY)
       error_tok(node->lhs->tok, "not an lvalue");
     if (node->lhs->ty->kind != TY_STRUCT)
-      node->rhs = new_cast(node->rhs, node->lhs->ty);
+      node->rhs = implicit_cast(node->rhs, node->lhs->ty);
     node->ty = node->lhs->ty;
     return;
   case ND_EQ:

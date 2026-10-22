@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include "../sdk/picocalc.h"
 #include "../sdk/sdk_internal.h"
 #include "../rt/exports.h"
@@ -186,7 +187,8 @@ static void pageSound() {
 static void pageSd() {
   title("SD card");
   int y = 24;
-  const char *path = "/sd/picocalc_studio_test.txt";
+  const char *path = "/sd/pico-dev/sdk_test.txt";
+  mkdir("/sd/pico-dev", 0777);
   FILE *f = fopen(path, "w");
   if (!f) {
     gfx_printf(4, y, RED, "fopen(%s) failed", path);

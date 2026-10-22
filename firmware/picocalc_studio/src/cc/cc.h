@@ -84,6 +84,7 @@ const char *cc_error(void);
 // Frees every allocation the compiler made (objects included).
 void cc_arena_free(void);
 size_t cc_arena_used(void);
+size_t cc_arena_peak(void);  // most chunk memory held at once since cc_arena_free()
 
 // Optional hooks.
 extern char *(*cc_read_file_hook)(const char *path, size_t *len);  // in-memory sources

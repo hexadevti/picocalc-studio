@@ -8,7 +8,7 @@
 #include <sys/stat.h>
 
 #ifndef TEST_DIR
-#define TEST_DIR "/sd/pico-dev/tests/tmp"
+#define TEST_DIR "/sd/pico-dev/tests/tmp_t18"   /* its own: the listing must see only our files */
 #endif
 
 static int cmp_str(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }

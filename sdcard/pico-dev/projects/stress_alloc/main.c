@@ -7,10 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define BLOCKS 64
 #define FILES 4
-#define TMP_DIR SD_ROOT "/pico-dev/tests/tmp"
+#define TMP_DIR SD_ROOT "/pico-dev/tests/tmp_stress"   /* not tests/tmp: t18 lists that */
 
 void setup(void)
 {
@@ -33,6 +34,7 @@ void setup(void)
     if (big) memset(big, 0xAA, 256 * 1024);
 
     FILE *files[FILES];
+    mkdir(TMP_DIR, 0777);
     for (int i = 0; i < FILES; i++) {
         char path[64];
         snprintf(path, sizeof path, TMP_DIR "/stress%d.tmp", i);

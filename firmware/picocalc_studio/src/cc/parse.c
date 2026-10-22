@@ -161,8 +161,10 @@ static int align_down(int n, int align) {
   return align_to(n - align + 1, align);
 }
 
+// A block scope lives in the function arena (when there is one), with its hashmaps.
 static void enter_scope(void) {
-  Scope *sc = calloc(1, sizeof(Scope));
+  Scope *sc = cc_fn_calloc(sizeof(Scope));
+  sc->vars.in_fn = sc->tags.in_fn = true;
   sc->next = scope;
   scope = sc;
 }
@@ -191,7 +193,7 @@ static Type *find_tag(Token *tok) {
 }
 
 static Node *new_node(NodeKind kind, Token *tok) {
-  Node *node = calloc(1, sizeof(Node));
+  Node *node = cc_fn_calloc(sizeof(Node));
   node->kind = kind;
   node->tok = tok;
   return node;
@@ -252,22 +254,34 @@ Node *new_cast(Node *expr, Type *ty) {
   if (ty->kind != TY_VOID && from_agg != to_agg)
     error_tok(expr->tok, "incompatible types: cannot convert between struct/union and non-struct type");
 
-  Node *node = calloc(1, sizeof(Node));
+  Node *node = cc_fn_calloc(sizeof(Node));
   node->kind = ND_CAST;
   node->tok = expr->tok;
   node->lhs = expr;
-  node->ty = copy_type(ty);
+  node->ty = ty;  // nothing modifies a cast's type, so it can be shared
   return node;
 }
 
+// An implicit conversion to the type a numeric operand already has generates no code; skipping
+// it saves a node and a Type copy each (they were a third of all nodes). Explicit casts still go
+// through new_cast, which also makes the result an rvalue.
+Node *implicit_cast(Node *expr, Type *ty) {
+  Type *t = expr->ty;
+  if (t->kind == ty->kind && t->size == ty->size && t->is_unsigned == ty->is_unsigned &&
+      !t->is_atomic && !ty->is_atomic && is_numeric(t))
+    return expr;
+  return new_cast(expr, ty);
+}
+
 static VarScope *push_scope(char *name) {
-  VarScope *sc = calloc(1, sizeof(VarScope));
+  VarScope *sc = scope == &global_scope ? calloc(1, sizeof(VarScope)) : cc_fn_calloc(sizeof(VarScope));
   hashmap_put(&scope->vars, name, sc);
   return sc;
 }
 
+// Initializers are done with once their declaration is parsed: in the function arena if open.
 static Initializer *new_initializer(Type *ty, bool is_flexible) {
-  Initializer *init = calloc(1, sizeof(Initializer));
+  Initializer *init = cc_fn_calloc(sizeof(Initializer));
   init->ty = ty;
 
   if (ty->kind == TY_ARRAY) {
@@ -276,7 +290,7 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
       return init;
     }
 
-    init->children = calloc(ty->array_len, sizeof(Initializer *));
+    init->children = cc_fn_calloc(ty->array_len * sizeof(Initializer *));
     for (int i = 0; i < ty->array_len; i++)
       init->children[i] = new_initializer(ty->base, false);
     return init;
@@ -288,11 +302,11 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
     for (Member *mem = ty->members; mem; mem = mem->next)
       len++;
 
-    init->children = calloc(len, sizeof(Initializer *));
+    init->children = cc_fn_calloc(len * sizeof(Initializer *));
 
     for (Member *mem = ty->members; mem; mem = mem->next) {
       if (is_flexible && ty->is_flexible && !mem->next) {
-        Initializer *child = calloc(1, sizeof(Initializer));
+        Initializer *child = cc_fn_calloc(sizeof(Initializer));
         child->ty = mem->ty;
         child->is_flexible = true;
         init->children[mem->idx] = child;
@@ -306,8 +320,7 @@ static Initializer *new_initializer(Type *ty, bool is_flexible) {
   return init;
 }
 
-static Obj *new_var(char *name, Type *ty) {
-  Obj *var = calloc(1, sizeof(Obj));
+static Obj *init_var(Obj *var, char *name, Type *ty) {
   var->name = name;
   var->ty = ty;
   var->align = ty->align;
@@ -315,8 +328,12 @@ static Obj *new_var(char *name, Type *ty) {
   return var;
 }
 
+static Obj *new_var(char *name, Type *ty) {
+  return init_var(calloc(1, sizeof(Obj)), name, ty);
+}
+
 static Obj *new_lvar(char *name, Type *ty) {
-  Obj *var = new_var(name, ty);
+  Obj *var = init_var(cc_fn_calloc(sizeof(Obj)), name, ty);
   var->is_local = true;
   var->next = locals;
   locals = var;
@@ -324,7 +341,7 @@ static Obj *new_lvar(char *name, Type *ty) {
 }
 
 static Obj *new_gvar(char *name, Type *ty) {
-  Obj *var = new_var(name, ty);
+  Obj *var = new_var(name, keep_type(ty));
   var->next = globals;
   var->is_static = true;
   var->is_definition = true;
@@ -337,6 +354,9 @@ static HashMap typename_map;
 
 // Clears all parser state so the next translation unit starts fresh (the
 // arena that held the previous one has been freed).
+static Obj *func_name;  // __func__ of the function being parsed, once used
+static bool keep_decl;  // the tokens of the declaration being parsed must outlive it
+
 void parse_reset(void) {
   locals = globals = current_fn = builtin_alloca = NULL;
   global_scope = (Scope){0};
@@ -345,6 +365,8 @@ void parse_reset(void) {
   brk_label = cont_label = NULL;
   unique_id = 0;
   typename_map = (HashMap){0};
+  keep_decl = false;
+  func_name = NULL;
 }
 
 static char *new_unique_name(void) {
@@ -530,12 +552,17 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       if (counter)
         break;
 
-      if (equal(tok, "struct")) {
-        ty = struct_decl(&tok, tok->next);
-      } else if (equal(tok, "union")) {
-        ty = union_decl(&tok, tok->next);
-      } else if (equal(tok, "enum")) {
-        ty = enum_specifier(&tok, tok->next);
+      // Tagged types stay in the main arena even inside a function: a static local may have one,
+      // and they are compared by identity.
+      if (equal(tok, "struct") || equal(tok, "union") || equal(tok, "enum")) {
+        bool fn_types = cc_fn_types(false);
+        if (equal(tok, "struct"))
+          ty = struct_decl(&tok, tok->next);
+        else if (equal(tok, "union"))
+          ty = union_decl(&tok, tok->next);
+        else
+          ty = enum_specifier(&tok, tok->next);
+        cc_fn_types(fn_types);
       } else if (equal(tok, "typeof")) {
         ty = typeof_specifier(&tok, tok->next);
       } else {
@@ -674,8 +701,8 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
       break;
     }
 
-    Type *ty2 = declspec(&tok, tok, NULL);
-    ty2 = declarator(&tok, tok, ty2);
+    Type *basety = declspec(&tok, tok, NULL);
+    Type *ty2 = declarator(&tok, tok, basety);
 
     Token *name = ty2->name;
 
@@ -691,7 +718,9 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
       ty2->name = name;
     }
 
-    cur = cur->next = copy_type(ty2);
+    // The list is linked through Type::next, so a shared type (int, a typedef) needs a copy;
+    // one the declarator just built is ours.
+    cur = cur->next = ty2 == basety ? copy_type(ty2) : ty2;
   }
 
   if (cur == &head)
@@ -1136,9 +1165,11 @@ static void designation(Token **rest, Token *tok, Initializer *init) {
 // An array length can be omitted if an array has an initializer
 // (e.g. `int x[] = {1,2,3}`). If it's omitted, count the number
 // of initializer elements.
-static int count_array_init_elements(Token *tok, Type *ty) {
+// With drop (at the top level), each element's Nodes are dropped once it is counted.
+static int count_array_init_elements(Token *tok, Type *ty, bool drop) {
   bool first = true;
   Initializer *dummy = new_initializer(ty->base, true);
+  CcFnMark m = cc_fn_mark();
 
   int i = 0, max = 0;
 
@@ -1156,6 +1187,8 @@ static int count_array_init_elements(Token *tok, Type *ty) {
     } else {
       initializer2(&tok, tok, dummy);
     }
+    if (drop)
+      cc_fn_release(m);
 
     i++;
     max = MAX(max, i);
@@ -1168,14 +1201,14 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
   tok = skip(tok, "{");
 
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty);
+    int len = count_array_init_elements(tok, init->ty, false);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
   bool first = true;
 
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty);
+    int len = count_array_init_elements(tok, init->ty, false);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
@@ -1206,7 +1239,7 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
 // array-initializer2 = initializer ("," initializer)*
 static void array_initializer2(Token **rest, Token *tok, Initializer *init, int i) {
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty);
+    int len = count_array_init_elements(tok, init->ty, false);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
@@ -1486,6 +1519,8 @@ static void write_buf(char *buf, uint64_t val, int sz) {
     unreachable();
 }
 
+static Relocation *write_gvar_scalar(Relocation *cur, Node *expr, Type *ty, char *buf, int offset);
+
 static Relocation *
 write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int offset) {
   if (ty->kind == TY_ARRAY) {
@@ -1525,19 +1560,22 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
 
   if (!init->expr)
     return cur;
+  return write_gvar_scalar(cur, init->expr, ty, buf, offset);
+}
 
+static Relocation *write_gvar_scalar(Relocation *cur, Node *expr, Type *ty, char *buf, int offset) {
   if (ty->kind == TY_FLOAT) {
-    *(float *)(buf + offset) = eval_double(init->expr);
+    *(float *)(buf + offset) = eval_double(expr);
     return cur;
   }
 
   if (ty->kind == TY_DOUBLE) {
-    *(double *)(buf + offset) = eval_double(init->expr);
+    *(double *)(buf + offset) = eval_double(expr);
     return cur;
   }
 
   char **label = NULL;
-  uint64_t val = eval2(init->expr, &label);
+  uint64_t val = eval2(expr, &label);
 
   if (!label) {
     write_buf(buf + offset, val, ty->size);
@@ -1552,18 +1590,176 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
   return cur->next;
 }
 
+// Data tables (arrays, of arrays, of numbers or pointers: fonts, sprites, lookup and string
+// tables) are written straight into the data as each element is parsed, without an Initializer
+// or Node per element. Element by element it follows initializer2() and the functions it calls.
+typedef struct {
+  char *buf;
+  Relocation *cur;
+  bool drop;  // at the top level: drop each element's Nodes once it is written
+} Table;
+
+static bool is_table(Type *ty) {
+  if (ty->kind != TY_ARRAY)
+    return false;
+  while (ty->kind == TY_ARRAY)
+    ty = ty->base;
+  return is_numeric(ty) || ty->kind == TY_PTR;
+}
+
+static void table_initializer2(Token **rest, Token *tok, Type *ty, Table *t, int offset);
+
+static void table_scalar(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+  CcFnMark m = cc_fn_mark();
+  Node *expr = assign(rest, tok);
+  add_type(expr);
+  t->cur = write_gvar_scalar(t->cur, expr, ty, t->buf, offset);
+  if (t->drop)
+    cc_fn_release(m);
+}
+
+static void table_string(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+  int sz = ty->base->size;
+  if (sz != 1 && sz != 2 && sz != 4)
+    unreachable();
+  int len = MIN(ty->array_len, tok->ty->array_len);
+  for (int i = 0; i < len; i++)
+    write_buf(t->buf + offset + sz * i, read_buf(tok->str + sz * i, sz), sz);
+  *rest = tok->next;
+}
+
+// Elements from the i'th on, without braces (array_initializer2).
+static void table_array2(Token **rest, Token *tok, Type *ty, Table *t, int offset, int i) {
+  for (; i < ty->array_len && !is_end(tok); i++) {
+    Token *start = tok;
+    if (i > 0)
+      tok = skip(tok, ",");
+
+    if (equal(tok, "[") || equal(tok, ".")) {
+      *rest = start;
+      return;
+    }
+
+    table_initializer2(&tok, tok, ty->base, t, offset + ty->base->size * i);
+  }
+  *rest = tok;
+}
+
+static void table_designation(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+  if (equal(tok, "[")) {
+    if (ty->kind != TY_ARRAY)
+      error_tok(tok, "array index in non-array initializer");
+
+    int begin, end;
+    array_designator(&tok, tok, ty, &begin, &end);
+
+    Token *tok2;
+    for (int i = begin; i <= end; i++)
+      table_designation(&tok2, tok, ty->base, t, offset + ty->base->size * i);
+    table_array2(rest, tok2, ty, t, offset, begin + 1);
+    return;
+  }
+
+  if (equal(tok, "."))
+    error_tok(tok, "field name not in struct or union initializer");
+
+  if (equal(tok, "="))
+    tok = tok->next;
+  table_initializer2(rest, tok, ty, t, offset);
+}
+
+// "{" elements "}" (array_initializer1).
+static void table_array1(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+  tok = skip(tok, "{");
+  bool first = true;
+
+  for (int i = 0; !consume_end(rest, tok); i++) {
+    if (!first)
+      tok = skip(tok, ",");
+    first = false;
+
+    if (equal(tok, "[")) {
+      int begin, end;
+      array_designator(&tok, tok, ty, &begin, &end);
+
+      Token *tok2;
+      for (int j = begin; j <= end; j++)
+        table_designation(&tok2, tok, ty->base, t, offset + ty->base->size * j);
+      tok = tok2;
+      i = end;
+      continue;
+    }
+
+    if (i < ty->array_len)
+      table_initializer2(&tok, tok, ty->base, t, offset + ty->base->size * i);
+    else
+      tok = skip_excess_element(tok);
+  }
+}
+
+static void table_initializer2(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+  if (ty->kind == TY_ARRAY) {
+    if (tok->kind == TK_STR)
+      table_string(rest, tok, ty, t, offset);
+    else if (equal(tok, "{"))
+      table_array1(rest, tok, ty, t, offset);
+    else
+      table_array2(rest, tok, ty, t, offset, 0);
+    return;
+  }
+
+  if (equal(tok, "{")) {
+    // A scalar in braces.
+    table_initializer2(&tok, tok->next, ty, t, offset);
+    *rest = skip(tok, "}");
+    return;
+  }
+
+  table_scalar(rest, tok, ty, t, offset);
+}
+
+static void table_initializer(Token **rest, Token *tok, Obj *var, bool drop) {
+  Type *ty = var->ty;
+  if (ty->size < 0) {
+    int len = tok->kind == TK_STR ? tok->ty->array_len : count_array_init_elements(tok->next, ty, drop);
+    ty = array_of(ty->base, len);
+  }
+  var->ty = keep_type(ty);
+
+  Table t = {calloc(1, var->ty->size), NULL, drop};
+  Relocation head = {};
+  t.cur = &head;
+  table_initializer2(rest, tok, var->ty, &t, 0);
+  var->init_data = t.buf;
+  var->rel = head.next;
+}
+
 // Initializers for global variables are evaluated at compile-time and
 // embedded to .data section. This function serializes Initializer
 // objects to a flat byte array. It is a compile error if an
 // initializer list contains a non-constant expression.
+// What survives is the data and its relocations (and the type); at the top level, the Initializer
+// tree and the Nodes (one per element of a table) go in the function arena and are dropped.
 static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
+  bool own = !cc_fn_is_open();
+  if (own)
+    cc_fn_begin();
+  if (is_table(var->ty) && (equal(tok, "{") || tok->kind == TK_STR)) {
+    table_initializer(rest, tok, var, own);
+    if (own)
+      cc_fn_end();
+    return;
+  }
   Initializer *init = initializer(rest, tok, var->ty, &var->ty);
+  var->ty = keep_type(var->ty);
 
   Relocation head = {};
   char *buf = calloc(1, var->ty->size);
   write_gvar_data(&head, init, var->ty, buf, 0);
   var->init_data = buf;
   var->rel = head.next;
+  if (own)
+    cc_fn_end();
 }
 
 // Returns true if a given token represents a type.
@@ -1629,7 +1825,7 @@ static Node *stmt(Token **rest, Token *tok) {
     add_type(exp);
     Type *ty = current_fn->ty->return_ty;
     if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
-      exp = new_cast(exp, current_fn->ty->return_ty);
+      exp = implicit_cast(exp, current_fn->ty->return_ty);
 
     node->lhs = exp;
     return node;
@@ -1688,8 +1884,8 @@ static Node *stmt(Token **rest, Token *tok) {
     node->lhs = stmt(rest, tok);
     node->begin = begin;
     node->end = end;
-    node->case_next = current_switch->case_next;
-    current_switch->case_next = node;
+    node->case_next = current_switch->cases;
+    current_switch->cases = node;
     return node;
   }
 
@@ -2216,6 +2412,11 @@ static Node *to_assign(Node *binary) {
     return node;
   }
 
+  // A variable has no side effects to evaluate once: `A op= B` is `A = A op B`. Keeping the
+  // address unused lets the code generator hold A in a register.
+  if (binary->lhs->kind == ND_VAR)
+    return new_binary(ND_ASSIGN, binary->lhs, binary, tok);
+
   // Convert `A op= B` to ``tmp = &A, *tmp = *tmp op B`.
   Obj *var = new_lvar("", pointer_to(binary->lhs->ty));
 
@@ -2670,6 +2871,8 @@ static void struct_members(Token **rest, Token *tok, Type *ty) {
       Member *mem = calloc(1, sizeof(Member));
       mem->ty = declarator(&tok, tok, basety);
       mem->name = mem->ty->name;
+      if (mem->name)
+        pin_token(mem->name);
       mem->idx = idx++;
       mem->align = attr.align ? attr.align : mem->ty->align;
 
@@ -2997,7 +3200,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
 
     if (param_ty) {
       if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
-        arg = new_cast(arg, param_ty);
+        arg = implicit_cast(arg, param_ty);
       param_ty = param_ty->next;
     } else if (arg->ty->kind == TY_FLOAT) {
       // If parameter type is omitted (e.g. in "..."), float
@@ -3199,6 +3402,15 @@ static Node *primary(Token **rest, Token *tok) {
         return new_num(sc->enum_val, tok);
     }
 
+    // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" (and GNU's __FUNCTION__) is the
+    // current function's name, made the first time it is used.
+    if (scope != &global_scope && (equal(tok, "__func__") || equal(tok, "__FUNCTION__"))) {
+      if (!func_name)
+        func_name = new_string_literal(current_fn->name,
+                                       array_of(ty_uchar, strlen(current_fn->name) + 1));
+      return new_var_node(func_name, tok);
+    }
+
     if (equal(tok->next, "("))
       error_tok(tok, "implicit declaration of a function");
     error_tok(tok, "undefined variable");
@@ -3325,6 +3537,10 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   if (consume(&tok, tok, ";"))
     return tok;
 
+  // Static inline functions wait for codegen_end(), which emits the ones that are used; the rest
+  // are compiled right away, and their Nodes and locals dropped.
+  if (fn->is_root)
+    cc_fn_begin();
   current_fn = fn;
   locals = NULL;
   enter_scope();
@@ -3345,20 +3561,19 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
 
   tok = skip(tok, "{");
 
-  // [https://www.sigbus.info/n1570#6.4.2.2p1] "__func__" is
-  // automatically defined as a local variable containing the
-  // current function name.
-  push_scope("__func__")->var =
-    new_string_literal(fn->name, array_of(ty_uchar, strlen(fn->name) + 1));
-
-  // [GNU] __FUNCTION__ is yet another name of __func__.
-  push_scope("__FUNCTION__")->var =
-    new_string_literal(fn->name, array_of(ty_uchar, strlen(fn->name) + 1));
-
+  func_name = NULL;
   fn->body = compound_stmt(&tok, tok);
   fn->locals = locals;
   leave_scope();
   resolve_goto_labels();
+  if (fn->is_root) {
+    codegen_function(fn);
+    fn->body = NULL;
+    fn->params = fn->locals = fn->va_area = fn->alloca_bottom = NULL;
+    cc_fn_end();
+  } else {
+    keep_decl = true;  // its Nodes point at the tokens until codegen_end()
+  }
   return tok;
 }
 
@@ -3439,7 +3654,16 @@ Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
 
-  while (tok->kind != TK_EOF) {
+  // The preprocessor hands over one top-level declaration at a time, ending each with a TK_MORE
+  // token; once it is parsed (and, for a function, compiled) its tokens are recycled.
+  for (Token *start = tok;;) {
+    if (tok->kind == TK_MORE) {
+      preprocess_release(start, tok, keep_decl);
+      keep_decl = false;
+      start = tok = preprocess_more(tok);
+    }
+    if (tok->kind == TK_EOF)
+      break;
     if (equal(tok, "_Static_assert")) {
       tok = static_assertion(tok);
       continue;

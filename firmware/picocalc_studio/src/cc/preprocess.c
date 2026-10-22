@@ -47,7 +47,12 @@ struct Macro {
   bool is_objlike; // Object-like or function-like
   MacroParam *params;
   char *va_args_name;
-  Token *body;
+  // The body is not kept as tokens but lexed again from its text for each expansion (most
+  // macros in the headers are never used): where its first token is, or "" if it is empty.
+  File *file;
+  char *loc;
+  int line_no;
+  bool has_space;
   macro_handler_fn *handler;
 };
 
@@ -58,6 +63,9 @@ struct CondIncl {
   enum { IN_THEN, IN_ELIF, IN_ELSE } ctx;
   Token *tok;
   bool included;
+  char *guard;       // include guard macro, if this is the #ifndef at the top of guard_file
+  char *guard_path;
+  File *guard_file;
 };
 
 typedef struct Hideset Hideset;
@@ -74,11 +82,26 @@ static HashMap include_path_cache;
 static HashMap include_guards;
 static int counter;
 
+static int depth;                     // preprocess2() nesting; 1 is the top-level pass
+static Token *root_src, *root_copy;  // last origin root keep_token() copied, and its copy
+static Token *raw_root;              // origin root of the last kept token
+static Token *pp_rest;               // where the top-level pass resumes for the next declaration
+static Token *batch_roots;           // origin roots copied for the current declaration
+static int nest;                     // ( [ { nesting of the top-level output
+static bool assigned, fn_body;       // "=" seen in this declaration; the open "{" is a function body
+static Token *guard_hash;            // a just-included file's "#ifndef X" / "#define X" opening
+static char *guard_macro, *guard_path;
+
 void preprocess_reset(void) {
   macros = pragma_once = include_path_cache = include_guards = (HashMap){0};
+  guard_hash = pp_rest = batch_roots = NULL;
+  nest = 0;
+  assigned = fn_body = false;
   cond_incl = NULL;
   include_next_idx = 0;
   counter = 0;
+  depth = 0;
+  root_src = root_copy = raw_root = NULL;
 }
 
 static Token *preprocess2(Token *tok);
@@ -100,10 +123,50 @@ static Token *skip_line(Token *tok) {
 }
 
 static Token *copy_token(Token *tok) {
-  Token *t = calloc(1, sizeof(Token));
+  Token *t = cc_tok_alloc();
   *t = *tok;
   t->next = NULL;
   return t;
+}
+
+// Copies a finished token of the top-level pass into the main arena, which the scratch arena
+// (raw tokens, macro bodies, expansion copies, hidesets) does not outlive. Files already live in
+// main. What survives: the token, a string literal's type and contents, and for a macro-expanded
+// token the root of its origin chain (codegen's line table only looks at the root).
+// A macro expansion's tokens come out together, so once one with another root is kept, the last
+// root (the macro name, a raw token) is free.
+static Token *keep_token(Token *t) {
+  if (raw_root && t->origin != raw_root) {
+    if (raw_root == root_src)
+      root_src = NULL;
+    cc_tok_free(raw_root);
+  }
+  raw_root = t->origin;
+  bool keep = cc_keep(true);
+  Token *c = copy_token(t);
+  c->hideset = NULL;
+  if (t->kind == TK_STR) {
+    Type *ty = calloc(1, sizeof(Type));
+    *ty = *t->ty;
+    c->ty = ty;
+    c->str = calloc(1, ty->size);
+    memcpy(c->str, t->str, ty->size);
+  }
+  if (t->origin) {
+    Token *r = t->origin;  // a root (expand_macro())
+    if (r != root_src) {
+      root_src = r;
+      root_copy = copy_token(r);
+      root_copy->origin = NULL;
+      root_copy->hideset = NULL;
+      root_copy->ty = NULL;
+      root_copy->next = batch_roots;
+      batch_roots = root_copy;
+    }
+    c->origin = root_copy;
+  }
+  cc_keep(keep);
+  return c;
 }
 
 static Token *new_eof(Token *tok) {
@@ -146,43 +209,38 @@ static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2) {
   return head.next;
 }
 
-static Token *add_hideset(Token *tok, Hideset *hs) {
-  Token head = {};
-  Token *cur = &head;
-
-  for (; tok; tok = tok->next) {
-    Token *t = copy_token(tok);
-    t->hideset = hideset_union(t->hideset, hs);
-    cur = cur->next = t;
-  }
-  return head.next;
-}
-
-// Append tok2 to the end of tok1.
-static Token *append(Token *tok1, Token *tok2) {
+// Append tok2 to the end of tok1, dropping tok1's EOF. tok1 is relinked in place (upstream
+// chibicc copies it), so it must be a list nobody else holds: a fresh macro expansion.
+static Token *splice(Token *tok1, Token *tok2) {
   if (tok1->kind == TK_EOF)
     return tok2;
 
-  Token head = {};
-  Token *cur = &head;
+  Token *t = tok1;
+  while (t->next->kind != TK_EOF)
+    t = t->next;
+  t->next = tok2;
+  return tok1;
+}
 
-  for (; tok1->kind != TK_EOF; tok1 = tok1->next)
-    cur = cur->next = copy_token(tok1);
-  cur->next = tok2;
-  return head.next;
+// Skipped tokens are raw ones nobody points at: at the top level they are recycled.
+static Token *drop_token(Token *tok) {
+  Token *next = tok->next;
+  if (depth == 1)
+    cc_tok_free(tok);
+  return next;
 }
 
 static Token *skip_cond_incl2(Token *tok) {
-  while (tok->kind != TK_EOF) {
+  while (more(tok)->kind != TK_EOF) {
     if (is_hash(tok) &&
         (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
          equal(tok->next, "ifndef"))) {
-      tok = skip_cond_incl2(tok->next->next);
+      tok = skip_cond_incl2(drop_token(drop_token(tok)));
       continue;
     }
     if (is_hash(tok) && equal(tok->next, "endif"))
-      return tok->next->next;
-    tok = tok->next;
+      return drop_token(drop_token(tok));
+    tok = drop_token(tok);
   }
   return tok;
 }
@@ -190,11 +248,11 @@ static Token *skip_cond_incl2(Token *tok) {
 // Skip until next `#else`, `#elif` or `#endif`.
 // Nested `#if` and `#endif` are skipped.
 static Token *skip_cond_incl(Token *tok) {
-  while (tok->kind != TK_EOF) {
+  while (more(tok)->kind != TK_EOF) {
     if (is_hash(tok) &&
         (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
          equal(tok->next, "ifndef"))) {
-      tok = skip_cond_incl2(tok->next->next);
+      tok = skip_cond_incl2(drop_token(drop_token(tok)));
       continue;
     }
 
@@ -202,7 +260,7 @@ static Token *skip_cond_incl(Token *tok) {
         (equal(tok->next, "elif") || equal(tok->next, "else") ||
          equal(tok->next, "endif")))
       break;
-    tok = tok->next;
+    tok = drop_token(tok);
   }
   return tok;
 }
@@ -247,6 +305,30 @@ static Token *copy_line(Token **rest, Token *tok) {
   cur->next = new_eof(tok);
   *rest = tok;
   return head.next;
+}
+
+// Like copy_line, but the returned list is the line's own tokens (raw scratch tokens nobody else
+// points at), cut off with an EOF.
+static Token *take_line(Token **rest, Token *tok) {
+  Token head = {};
+  Token *cur = &head;
+
+  for (; !tok->at_bol; tok = tok->next)
+    cur = cur->next = tok;
+
+  cur->next = new_eof(tok);
+  *rest = tok;
+  return head.next;
+}
+
+// Recycles the directive tokens from tok up to (not including) end.
+// With end NULL, up to and including an EOF.
+static void free_tokens(Token *tok, Token *end) {
+  while (tok != end) {
+    Token *next = tok->kind == TK_EOF ? NULL : tok->next;
+    cc_tok_free(tok);
+    tok = next;
+  }
 }
 
 static Token *new_num_token(int val, Token *tmpl) {
@@ -334,13 +416,27 @@ static Macro *find_macro(Token *tok) {
   return hashmap_get2(&macros, tok->loc, tok->len);
 }
 
+// body is a line's raw tokens ending in an EOF (NULL for a built-in); they are recycled.
 static Macro *add_macro(char *name, bool is_objlike, Token *body) {
   Macro *m = calloc(1, sizeof(Macro));
   m->name = name;
   m->is_objlike = is_objlike;
-  m->body = body;
+  if (body) {
+    m->file = body->file;
+    m->line_no = body->line_no;
+    m->has_space = body->has_space;
+    m->loc = body->kind == TK_EOF ? "" : body->loc;
+    free_tokens(body, NULL);
+  }
   hashmap_put(&macros, name, m);
   return m;
+}
+
+static Token *macro_body(Macro *m) {
+  Token *body = tokenize_line(m->file, m->loc, m->line_no);
+  body->at_bol = false;
+  body->has_space = m->has_space;
+  return body;
 }
 
 static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_args_name) {
@@ -380,19 +476,22 @@ static void read_macro_definition(Token **rest, Token *tok) {
   if (tok->kind != TK_IDENT)
     error_tok(tok, "macro name must be an identifier");
   char *name = strndup(tok->loc, tok->len);
+  Token *name_tok = tok;
   tok = tok->next;
 
   if (!tok->has_space && equal(tok, "(")) {
     // Function-like macro
     char *va_args_name = NULL;
     MacroParam *params = read_macro_params(&tok, tok->next, &va_args_name);
+    free_tokens(name_tok, tok);
 
-    Macro *m = add_macro(name, false, copy_line(rest, tok));
+    Macro *m = add_macro(name, false, take_line(rest, tok));
     m->params = params;
     m->va_args_name = va_args_name;
   } else {
     // Object-like macro
-    add_macro(name, true, copy_line(rest, tok));
+    free_tokens(name_tok, tok);
+    add_macro(name, true, take_line(rest, tok));
   }
 }
 
@@ -402,6 +501,7 @@ static MacroArg *read_macro_arg_one(Token **rest, Token *tok, bool read_rest) {
   int level = 0;
 
   for (;;) {
+    more(tok);
     if (level == 0 && equal(tok, ")"))
       break;
     if (level == 0 && !read_rest && equal(tok, ","))
@@ -445,7 +545,7 @@ read_macro_args(Token **rest, Token *tok, MacroParam *params, char *va_args_name
 
   if (va_args_name) {
     MacroArg *arg;
-    if (equal(tok, ")")) {
+    if (equal(more(tok), ")")) {
       arg = calloc(1, sizeof(MacroArg));
       arg->tok = new_eof(tok);
     } else {
@@ -654,23 +754,36 @@ static bool expand_macro(Token **rest, Token *tok) {
   }
 
   // Object-like macro application
+  // Expanded tokens point at the root of the macro token's origin chain, so only a root is
+  // ever an origin (keep_token() frees it after use). The rest of the invocation is freed here
+  // at the top level; below it, expansions are for a caller that copies what it needs.
+  Token *root = tok->origin ? tok->origin : tok;
+
   if (m->is_objlike) {
     Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
-    Token *body = add_hideset(m->body, hs);
-    for (Token *t = body; t->kind != TK_EOF; t = t->next)
-      t->origin = tok;
-    *rest = append(body, tok->next);
+    Token *body = macro_body(m), *eof = body;
+    for (; eof->kind != TK_EOF; eof = eof->next) {
+      eof->hideset = hs;
+      eof->origin = root;
+    }
+    *rest = splice(body, tok->next);
     (*rest)->at_bol = tok->at_bol;
     (*rest)->has_space = tok->has_space;
+    cc_tok_free(eof);
+    if (depth == 1 && (tok != root || body == eof))
+      cc_tok_free(tok);
     return true;
   }
 
   // If a funclike macro token is not followed by an argument list,
   // treat it as a normal identifier.
-  if (!equal(tok->next, "("))
+  if (!equal(more(tok->next), "("))
     return false;
 
   // Function-like macro application
+  bool top = depth == 1;
+  if (top)
+    cc_tok_track(true);
   Token *macro_token = tok;
   MacroArg *args = read_macro_args(&tok, tok, m->params, m->va_args_name);
   Token *rparen = tok;
@@ -683,13 +796,29 @@ static bool expand_macro(Token **rest, Token *tok) {
   Hideset *hs = hideset_intersection(macro_token->hideset, rparen->hideset);
   hs = hideset_union(hs, new_hideset(m->name));
 
-  Token *body = subst(m->body, args);
-  body = add_hideset(body, hs);
-  for (Token *t = body; t->kind != TK_EOF; t = t->next)
-    t->origin = macro_token;
-  *rest = append(body, tok->next);
+  // subst() returns fresh tokens ending in the EOF of def, so tag them in place; def is
+  // garbage after the splice.
+  Token *def = macro_body(m);
+  Token *body = subst(def, args);
+  for (Token *t = body; t->kind != TK_EOF; t = t->next) {
+    t->hideset = hideset_union(t->hideset, hs);
+    t->origin = root;
+    t->marked = top;
+  }
+  *rest = splice(body, tok->next);
   (*rest)->at_bol = macro_token->at_bol;
   (*rest)->has_space = macro_token->has_space;
+  free_tokens(def, NULL);
+  if (top) {
+    cc_tok_sweep();
+    for (Token *t = macro_token->next, *next; t != rparen; t = next) {
+      next = t->next;
+      cc_tok_free(t);
+    }
+    cc_tok_free(rparen);
+    if (macro_token != root || body->kind == TK_EOF)
+      cc_tok_free(macro_token);
+  }
   return true;
 }
 
@@ -763,45 +892,6 @@ static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote) {
   error_tok(tok, "expected a filename");
 }
 
-// Detect the following "include guard" pattern.
-//
-//   #ifndef FOO_H
-//   #define FOO_H
-//   ...
-//   #endif
-static char *detect_include_guard(Token *tok) {
-  // Detect the first two lines.
-  if (!is_hash(tok) || !equal(tok->next, "ifndef"))
-    return NULL;
-  tok = tok->next->next;
-
-  if (tok->kind != TK_IDENT)
-    return NULL;
-
-  char *macro = strndup(tok->loc, tok->len);
-  tok = tok->next;
-
-  if (!is_hash(tok) || !equal(tok->next, "define") || !equal(tok->next->next, macro))
-    return NULL;
-
-  // Read until the end of the file.
-  while (tok->kind != TK_EOF) {
-    if (!is_hash(tok)) {
-      tok = tok->next;
-      continue;
-    }
-
-    if (equal(tok->next, "endif") && tok->next->next->kind == TK_EOF)
-      return macro;
-
-    if (equal(tok, "if") || equal(tok, "ifdef") || equal(tok, "ifndef"))
-      tok = skip_cond_incl(tok->next);
-    else
-      tok = tok->next;
-  }
-  return NULL;
-}
-
 static Token *include_file(Token *tok, char *path, Token *filename_tok) {
   // Check for "#pragma once"
   if (hashmap_get(&pragma_once, path))
@@ -814,15 +904,24 @@ static Token *include_file(Token *tok, char *path, Token *filename_tok) {
   if (guard_name && hashmap_get(&macros, guard_name))
     return tok;
 
-  Token *tok2 = tokenize_file(path);
+  Token *tok2 = tokenize_file(path, tok);
   if (!tok2)
     error_tok(filename_tok, "%s: cannot open file (no such file)", path);
 
-  guard_name = detect_include_guard(tok2);
-  if (guard_name)
-    hashmap_put(&include_guards, path, guard_name);
-
-  return append(tok2, tok);
+  // A file opening with "#ifndef FOO" / "#define FOO" may be guarded. The #ifndef handler picks
+  // this up, and the matching #endif confirms it if it turns out to end the file.
+  Token *t = more(tok2);
+  if (is_hash(t) && !strcmp(t->file->name, path) && equal(t->next, "ifndef") &&
+      t->next->next->kind == TK_IDENT) {
+    char *macro = strndup(t->next->next->loc, t->next->next->len);
+    Token *d = more(t->next->next->next);
+    if (is_hash(d) && equal(d->next, "define") && equal(d->next->next, macro)) {
+      guard_hash = t;
+      guard_macro = macro;
+      guard_path = path;
+    }
+  }
+  return tok2;
 }
 
 // Read #line arguments
@@ -840,26 +939,89 @@ static void read_line_marker(Token **rest, Token *tok) {
 
   if (tok->kind != TK_STR)
     error_tok(tok, "filename expected");
-  start->file->display_name = tok->str;
+  bool keep = cc_keep(true);
+  start->file->display_name = strdup(tok->str);
+  cc_keep(keep);
+}
+
+// Does output token t (after prev) end a top-level declaration? That is a ";" outside any
+// brackets, or the "}" closing a function body: a "{" right after ")" with no "=" before it in the
+// declaration (which would make it a compound literal). A missed end only makes a batch longer.
+static bool ends_decl(Token *t, Token *prev) {
+  if (t->kind != TK_PUNCT || t->len != 1)
+    return false;
+  switch (*t->loc) {
+  case '(': case '[':
+    nest++;
+    return false;
+  case ')': case ']':
+    nest--;
+    return false;
+  case '{':
+    if (nest++ == 0)
+      fn_body = !assigned && prev && equal(prev, ")");
+    return false;
+  case '=':
+    if (nest == 0)
+      assigned = true;
+    return false;
+  case '}':
+    if (--nest != 0 || !fn_body)
+      return false;
+    fn_body = false;
+    break;
+  case ';':
+    if (nest != 0)
+      return false;
+    break;
+  default:
+    return false;
+  }
+  assigned = false;
+  return true;
 }
 
 // Visit all tokens in `tok` while evaluating preprocessing
 // macros and directives.
+// At the top level, each output token is copied into the main arena as it is produced and its
+// scratch slot recycled, and the pass stops after each top-level declaration, ending the list
+// with a TK_MORE token for preprocess_more(). Nested calls (#if, macro arguments, #include and
+// #line operands) produce scratch lists their callers still work on.
 static Token *preprocess2(Token *tok) {
   Token head = {};
   Token *cur = &head;
+  bool top = ++depth == 1;
 
-  while (tok->kind != TK_EOF) {
+  while (more(tok)->kind != TK_EOF) {
     // If it is a macro, expand it.
     if (expand_macro(&tok, tok))
       continue;
 
     // Pass through if it is not a "#".
     if (!is_hash(tok)) {
-      tok->line_delta = tok->file->line_delta;
-      tok->filename = tok->file->display_name;
-      cur = cur->next = tok;
-      tok = tok->next;
+      tok->line_no += tok->file->line_delta;
+      Token *next = tok->next;
+      if (!top) {
+        cur = cur->next = tok;
+        tok = next;
+        continue;
+      }
+      Token *prev = cur == &head ? NULL : cur;
+      cur = cur->next = keep_token(tok);
+      cc_tok_free(tok);
+      tok = next;
+      if (ends_decl(cur, prev)) {
+        pp_rest = tok;
+        root_src = NULL;  // the next declaration's tokens get roots of their own
+        bool keep = cc_keep(true);
+        Token *m = cur->next = copy_token(cur);
+        cc_keep(keep);
+        m->kind = TK_MORE;
+        m->len = 0;
+        m->origin = NULL;
+        depth--;
+        return head.next;
+      }
       continue;
     }
 
@@ -892,7 +1054,9 @@ static Token *preprocess2(Token *tok) {
     }
 
     if (equal(tok, "define")) {
-      read_macro_definition(&tok, tok->next);
+      Token *name = tok->next;
+      read_macro_definition(&tok, name);
+      free_tokens(start, name);
       continue;
     }
 
@@ -924,7 +1088,13 @@ static Token *preprocess2(Token *tok) {
 
     if (equal(tok, "ifndef")) {
       bool defined = find_macro(tok->next);
-      push_cond_incl(tok, !defined);
+      CondIncl *ci = push_cond_incl(tok, !defined);
+      if (start == guard_hash) {
+        ci->guard = guard_macro;
+        ci->guard_path = guard_path;
+        ci->guard_file = start->file;
+      }
+      guard_hash = NULL;
       tok = skip_line(tok->next->next);
       if (defined)
         tok = skip_cond_incl(tok);
@@ -957,8 +1127,13 @@ static Token *preprocess2(Token *tok) {
     if (equal(tok, "endif")) {
       if (!cond_incl)
         error_tok(start, "stray #endif");
-      cond_incl = cond_incl->next;
+      CondIncl *ci = cond_incl;
+      cond_incl = ci->next;
       tok = skip_line(tok->next);
+      // The guard's #endif ends the file: including it again does nothing while FOO is defined.
+      if (ci->guard && ci->ctx == IN_THEN &&
+          (more(tok)->kind == TK_EOF || tok->file != ci->guard_file))
+        hashmap_put(&include_guards, ci->guard_path, ci->guard);
       continue;
     }
 
@@ -1001,7 +1176,10 @@ static Token *preprocess2(Token *tok) {
     error_tok(tok, "invalid preprocessor directive");
   }
 
-  cur->next = tok;
+  if (top && cond_incl)
+    error_tok(cond_incl->tok, "unterminated conditional directive");
+  cur->next = top ? keep_token(tok) : tok;
+  depth--;
   return head.next;
 }
 
@@ -1155,7 +1333,7 @@ static void join_adjacent_string_literals(Token *tok) {
   // First pass: If regular string literals are adjacent to wide
   // string literals, regular string literals are converted to a wide
   // type before concatenation. In this pass, we do the conversion.
-  for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
+  for (Token *tok1 = tok; tok1->kind != TK_EOF && tok1->kind != TK_MORE;) {
     if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
       tok1 = tok1->next;
       continue;
@@ -1184,7 +1362,7 @@ static void join_adjacent_string_literals(Token *tok) {
   }
 
   // Second pass: concatenate adjacent string literals.
-  for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
+  for (Token *tok1 = tok; tok1->kind != TK_EOF && tok1->kind != TK_MORE;) {
     if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
       tok1 = tok1->next;
       continue;
@@ -1214,15 +1392,49 @@ static void join_adjacent_string_literals(Token *tok) {
   }
 }
 
-// Entry point function of the preprocessor.
-Token *preprocess(Token *tok) {
-  tok = preprocess2(tok);
-  if (cond_incl)
-    error_tok(cond_incl->tok, "unterminated conditional directive");
+static Token *finish(Token *tok, bool top) {
+  bool keep = cc_keep(top);  // the top-level list is in main; so must be what these build
   convert_pp_tokens(tok);
   join_adjacent_string_literals(tok);
-
-  for (Token *t = tok; t; t = t->next)
-    t->line_no += t->line_delta;
+  cc_keep(keep);
   return tok;
+}
+
+// Entry point function of the preprocessor. At the top level it returns only the first top-level
+// declaration; the parser gets the rest from preprocess_more().
+Token *preprocess(Token *tok) {
+  return finish(preprocess2(tok), depth == 0);
+}
+
+// Replaces t, the TK_MORE token ending the parser's last declaration, with the next one.
+Token *preprocess_more(Token *t) {
+  bool keep = cc_keep(false);
+  Token *first = finish(preprocess2(pp_rest), true);
+  cc_keep(keep);
+  *t = *first;
+  cc_tok_free(first);
+  return t;
+}
+
+// Recycles the tokens [tok, end) of a parsed declaration and the origin roots copied for them,
+// except pinned ones; with keep, all of them stay (a function compiled only at the end).
+void preprocess_release(Token *tok, Token *end, bool keep) {
+  for (Token *next; !keep && tok != end; tok = next) {
+    next = tok->next;
+    if (!tok->pinned)
+      cc_tok_free(tok);
+  }
+  for (Token *r = batch_roots, *next; !keep && r; r = next) {
+    next = r->next;
+    if (!r->pinned)
+      cc_tok_free(r);
+  }
+  batch_roots = NULL;
+}
+
+// Keeps a token (and its origin root) alive after its declaration, for a type that refers to it.
+void pin_token(Token *tok) {
+  tok->pinned = true;
+  if (tok->origin)
+    tok->origin->pinned = true;
 }

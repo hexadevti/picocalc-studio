@@ -5,7 +5,23 @@
 
 #define ROW_H 12           // list rows
 
+void (*ui_loader_hook)();
+
+static int readKey();
+
 int ui_key() {
+  static bool inHook;
+  const int k = readKey();
+  const int base = k & 0xFF;
+  if ((base == KEY_F10 || (base == KEY_F5 && (k & UI_SHIFT))) && ui_loader_hook && !inHook) {
+    inHook = true;
+    ui_loader_hook();   // returns only if the user cancelled
+    inHook = false;
+  }
+  return k;
+}
+
+static int readKey() {
   int k = kbd_get();
   if (k == KEY_NONE) return KEY_NONE;
   const int mods = kbd_mods();
@@ -133,13 +149,13 @@ bool ui_input(const char *title, const char *prompt, char *buf, int size) {
 }
 
 int ui_ask(const char *question, const char *keys) {
-  box(124, 36, nullptr);
-  gfx_clip(10, 124, SCREEN_W - 20, 36);
-  gfx_text(14, 131, question, WHITE);
-  gfx_noclip();
-  gfx_text(14, 145, "Esc: cancel", UI_DIM);
-  gfx_flush_rect(8, 124, SCREEN_W - 16, 36);
-  for (;;) {
+  for (;;) {   // redrawn after each key: a cancelled F10 question covers this one
+    box(124, 36, nullptr);
+    gfx_clip(10, 124, SCREEN_W - 20, 36);
+    gfx_text(14, 131, question, WHITE);
+    gfx_noclip();
+    gfx_text(14, 145, "Esc: cancel", UI_DIM);
+    gfx_flush_rect(8, 124, SCREEN_W - 16, 36);
     int k = ui_wait_key() & 0xFF;
     if (k == KEY_ESC) return KEY_ESC;
     if (k >= 'A' && k <= 'Z') k += 'a' - 'A';

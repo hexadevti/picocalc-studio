@@ -2,6 +2,7 @@
 
 // Input file
 static File *current_file;
+static int line_no;  // line being lexed
 
 // A list of all input files.
 static File **input_files;
@@ -105,12 +106,14 @@ bool consume(Token **rest, Token *tok, char *str) {
 
 // Create a new token.
 static Token *new_token(TokenKind kind, char *start, char *end) {
-  Token *tok = calloc(1, sizeof(Token));
+  Token *tok = cc_tok_alloc();
   tok->kind = kind;
   tok->loc = start;
+  if (end - start >= 1 << 21)  // Token::len is 22 bits
+    error_at(start, "token too long");
   tok->len = end - start;
   tok->file = current_file;
-  tok->filename = current_file->display_name;
+  tok->line_no = line_no;
   tok->at_bol = at_bol;
   tok->has_space = has_space;
 
@@ -472,8 +475,8 @@ static void convert_pp_number(Token *tok) {
 }
 
 void convert_pp_tokens(Token *tok) {
-  for (Token *t = tok; t->kind != TK_EOF; t = t->next) {
-    if (t->bad_literal)
+  for (Token *t = tok; t->kind != TK_EOF && t->kind != TK_MORE; t = t->next) {
+    if (t->kind == TK_PUNCT && t->bad_literal)
       error_tok(t, "%s", t->bad_literal);
     if (is_keyword(t))
       t->kind = TK_KEYWORD;
@@ -482,36 +485,31 @@ void convert_pp_tokens(Token *tok) {
   }
 }
 
-// Initialize line info for all tokens.
-static void add_line_numbers(Token *tok) {
-  char *p = current_file->contents;
-  int n = 1;
-
-  do {
-    if (p == tok->loc) {
-      tok->line_no = n;
-      tok = tok->next;
-    }
-    if (*p == '\n')
-      n++;
-  } while (*p++);
-}
-
 Token *tokenize_string_literal(Token *tok, Type *basety) {
   Token *t;
   if (basety->size == 2)
     t = read_utf16_string_literal(tok->loc, tok->loc);
   else
     t = read_utf32_string_literal(tok->loc, tok->loc, basety);
+  t->file = tok->file;
+  t->line_no = tok->line_no;
   t->next = tok->next;
   return t;
 }
 
-// Tokenize a given string and returns new tokens.
-Token *tokenize(File *file) {
-  current_file = file;
+// Lines lexed per chunk of a lazily tokenized file.
+#define LEX_LINES 32
 
-  char *p = file->contents;
+// Tokenizes file from p, which starts line `line`. Lazily, it stops at the first line break
+// after LEX_LINES lines with a TK_MORE token that tokenize_more() resumes from, so raw tokens are
+// produced only as the preprocessor gets to them and their slots can be recycled. Chunks end only
+// between lines, so a directive line is always whole. At the end of the file the list continues
+// with file->after, or an EOF token. With one_line, it stops at the end of the line with an EOF.
+static Token *lex(File *file, char *p, int line, bool lazy, bool one_line) {
+  current_file = file;
+  line_no = line;
+  int stop = line + LEX_LINES;
+
   Token head = {};
   Token *cur = &head;
 
@@ -533,6 +531,9 @@ Token *tokenize(File *file) {
       char *q = strstr(p + 2, "*/");
       if (!q)
         error_at(p, "unclosed block comment");
+      for (; p < q; p++)
+        if (*p == '\n')
+          line_no++;
       p = q + 2;
       has_space = true;
       continue;
@@ -540,9 +541,16 @@ Token *tokenize(File *file) {
 
     // Skip newline.
     if (*p == '\n') {
+      if (one_line)
+        break;
       p++;
+      line_no++;
       at_bol = true;
       has_space = false;
+      if (lazy && line_no >= stop && *p) {
+        cur->next = new_token(TK_MORE, p, p);
+        return head.next;
+      }
       continue;
     }
 
@@ -652,9 +660,28 @@ Token *tokenize(File *file) {
     error_at(p, "invalid token");
   }
 
-  cur = cur->next = new_token(TK_EOF, p, p);
-  add_line_numbers(head.next);
+  cur->next = file->after && !one_line ? file->after : new_token(TK_EOF, p, p);
   return head.next;
+}
+
+// Tokenizes the rest of the line at p (a macro body) again, ending it with an EOF.
+Token *tokenize_line(File *file, char *p, int line) {
+  return lex(file, p, line, false, true);
+}
+
+// Tokenize a given string and returns new tokens.
+Token *tokenize(File *file) {
+  return lex(file, file->contents, 1, false, false);
+}
+
+// Replaces a TK_MORE token, in place, with the first token of the next chunk (which may be
+// another TK_MORE, or the includer's token after the file), and recycles that token's slot.
+void tokenize_more(Token *tok) {
+  bool track = cc_tok_track(false);  // the input, not part of a macro expansion
+  Token *first = lex(tok->file, tok->loc, tok->line_no, true, false);
+  *tok = *first;
+  cc_tok_free(first);
+  cc_tok_track(track);
 }
 
 // Returns the contents of a given file. cc_read_file_hook, when set, is asked
@@ -696,12 +723,16 @@ File **get_input_files(void) {
   return input_files;
 }
 
+// Files outlive the preprocessor's scratch arena (tokens point into their contents), so they and
+// their contents always go in the main arena. name must already live there.
 File *new_file(char *name, int file_no, char *contents) {
+  bool keep = cc_keep(true);
   File *file = calloc(1, sizeof(File));
   file->name = name;
   file->display_name = name;
   file->file_no = file_no;
-  file->contents = contents;
+  file->contents = strdup(contents);
+  cc_keep(keep);
   return file;
 }
 
@@ -802,10 +833,14 @@ void tokenize_reset(void) {
   keyword_map = (HashMap){0};
 }
 
-Token *tokenize_file(char *path) {
+// Tokenizes a file lazily (see lex()); its tokens are followed by `after`, or EOF if NULL.
+Token *tokenize_file(char *path, Token *after) {
+  bool keep = cc_keep(true);  // the File and its contents outlive the scratch arena
   char *p = read_file(path);
-  if (!p)
+  if (!p) {
+    cc_keep(keep);
     return NULL;
+  }
 
   // UTF-8 texts may start with a 3-byte "BOM" marker sequence.
   // If exists, just skip them because they are useless bytes.
@@ -818,13 +853,18 @@ Token *tokenize_file(char *path) {
   remove_backslash_newline(p);
   convert_universal_chars(p);
 
-  File *file = new_file(path, file_no + 1, p);
+  File *file = calloc(1, sizeof(File));
+  file->name = file->display_name = strdup(path);
+  file->file_no = file_no + 1;
+  file->contents = p;
+  file->after = after;
 
   input_files = cc_realloc(input_files, sizeof(File *) * (file_no + 1),
                            sizeof(File *) * (file_no + 2));
   input_files[file_no] = file;
   input_files[file_no + 1] = NULL;
   file_no++;
+  cc_keep(keep);
 
-  return tokenize(file);
+  return lex(file, p, 1, true, false);
 }

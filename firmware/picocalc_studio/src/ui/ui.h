@@ -22,6 +22,10 @@
 #define UI_ALT   0x200
 #define UI_SHIFT 0x400
 int ui_key();              // KEY_NONE if no key is waiting
+
+// Called by ui_key() on F10 or Shift-F5, on any screen: goes back to the loader, or returns if the
+// user cancels (the key is then passed on, and callers ignore it and redraw).
+extern void (*ui_loader_hook)();
 int ui_wait_key();
 
 // A vertical scroll bar: `visible` of `total` rows shown, starting at row `top`.

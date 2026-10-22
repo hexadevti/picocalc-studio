@@ -1,6 +1,9 @@
 // pcc_main.c - host driver for the PicoCalc C compiler (firmware/picocalc_studio/src/cc).
 //
-//   pcc [-I dir]... [-D name[=value]]... [--exports file] file.c... -o out.pcx
+//   pcc [-I dir]... [-D name[=value]]... [--exports file] [--mem] file.c... -o out.pcx
+//
+// --mem prints the compiler arena's peak (chunk bytes) to stderr. Only a 32-bit build matches the
+// device's struct sizes: see tools/host/mem.py.
 //
 // Defaults: -I <repo>/sdcard/pico-dev/include, --exports <repo>/firmware/.../src/rt/exports_table.S
 // (both found relative to this executable in <repo>/build/host). Built by build_host.py.
@@ -79,6 +82,7 @@ int main(int argc, char **argv) {
   const char *incs[64], *defs[64], *srcs[64];
   int ninc = 0, ndef = 0, nsrc = 0;
   const char *out = NULL, *exp = NULL;
+  int mem = 0;
 
   for (int i = 1; i < argc; i++) {
     char *a = argv[i];
@@ -86,6 +90,8 @@ int main(int argc, char **argv) {
       out = argv[++i];
     else if (!strcmp(a, "--exports") && i + 1 < argc)
       exp = argv[++i];
+    else if (!strcmp(a, "--mem"))
+      mem = 1;
     else if (!strncmp(a, "-I", 2))
       incs[ninc++] = a[2] ? a + 2 : argv[++i];
     else if (!strncmp(a, "-D", 2))
@@ -119,6 +125,9 @@ int main(int argc, char **argv) {
     fputc('\n', stderr);
     return 1;
   }
+  if (mem)
+    fprintf(stderr, "mem: arena peak %lu image %lu\n", (unsigned long)cc_arena_peak(),
+            (unsigned long)size);
   FILE *fp = fopen(out, "wb");
   if (!fp || fwrite(image, 1, size, fp) != size) {
     fprintf(stderr, "pcc: cannot write %s\n", out);

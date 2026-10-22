@@ -1,7 +1,7 @@
 # PicoCalc Studio compiler test suite
 
 Acceptance gate for the on-device C compiler (`firmware/picocalc_studio/src/cc`).
-Copied to `/sd/pico-dev/tests/` and `/sd/projects/` on the SD card.
+Copied to `/sd/pico-dev/tests/` and `/sd/pico-dev/projects/` on the SD card.
 
 | Dir | What | How it's checked |
 |---|---|---|

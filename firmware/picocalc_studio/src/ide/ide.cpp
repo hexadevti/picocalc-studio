@@ -13,6 +13,7 @@
 #include "ide.h"
 #include "doc.h"
 #include "editor.h"
+#include "complete.h"
 #include "../ui/ui.h"
 #include "../sdk/sdk_internal.h"
 #include "../hal/hal.h"
@@ -21,7 +22,8 @@
 #include "../demo/demo.h"
 #include "../export/export.h"
 
-#define PROJECTS_DIR "/sd/projects"
+#define ROOT_DIR     "/sd/pico-dev"
+#define PROJECTS_DIR "/sd/pico-dev/projects"
 #define EXAMPLES_DIR "/sd/pico-dev/examples"
 #define INCLUDE_DIR  "/sd/pico-dev/include"
 #define CFG_PATH     "/sd/pico-dev/ide.cfg"
@@ -30,8 +32,8 @@
 #define MAX_ITEMS    96
 #define OUT_MAX      (16 * 1024)
 #define PANEL_ROWS   7
+#define HINT_COLOR   RGB(230, 230, 160)
 
-static const char *const kRoots[] = {PROJECTS_DIR, "/sd/pico-dev/projects"};
 
 static jmp_buf s_jmp;
 static char s_proj[160];                 // open project folder, "" if none
@@ -46,7 +48,7 @@ static char s_errPath[192];              // line marked red: last error or crash
 static int s_errLine = -1;
 static char s_find[64];
 static char s_repl[64];
-static char s_battery[8];
+static char s_battery[16];
 static uint32_t s_batteryAt;
 
 // ---- small helpers ----
@@ -181,6 +183,7 @@ static bool saveAll() {
       setMsg(RED, "Can't save %s", baseName(s_docs[i]->path));
       return false;
     }
+  ac_project(INCLUDE_DIR, s_proj);   // the saved text is the project's names now
   return true;
 }
 
@@ -203,12 +206,14 @@ static bool closeProject() {
   s_cur = 0;
   s_proj[0] = 0;
   s_errPath[0] = 0;
+  ac_project(INCLUDE_DIR, "");
   return true;
 }
 
 // Opens a project folder and `file` in it, or its main.c / first source file.
 static bool openProject(const char *dir, const char *file) {
   snprintf(s_proj, sizeof s_proj, "%s", dir);
+  ac_project(INCLUDE_DIR, s_proj);
   if (file && *file && openFile(file)) return true;
   char main[192];
   snprintf(main, sizeof main, "%s/main.c", dir);
@@ -373,7 +378,7 @@ static void exportApp() {
     s_panel = true;
     return;
   }
-  outPrintf("Exported %s: %ld KB, %lu ms\nFlash it from PicoMultiLoader (F10 in the project list).\n",
+  outPrintf("Exported %s: %ld KB, %lu ms\nFlash it from PicoMultiLoader (F10: back to the loader).\n",
             path, n / 1024, (unsigned long)ms);
   hal_log("export %s: %s, %ld bytes, %lu ms", s_proj, path, n, (unsigned long)ms);
   setMsg(GREEN, "Exported %s (%ld KB)", path, n / 1024);
@@ -387,6 +392,7 @@ static void newProject() {
   for (char *p = name; *p; p++)
     if (!isalnum((unsigned char)*p) && *p != '_' && *p != '-') { ui_message("Use letters, digits, _ and - only."); return; }
   char dir[160], path[200];
+  mkdir(ROOT_DIR, 0777);
   mkdir(PROJECTS_DIR, 0777);
   snprintf(dir, sizeof dir, PROJECTS_DIR "/%s", name);
   if (isDir(dir)) { ui_message("That project already exists."); return; }
@@ -428,7 +434,7 @@ static bool copyDir(const char *from, const char *to) {
   return ok;
 }
 
-// "+ New from example": copies one of /sd/pico-dev/examples into /sd/projects and opens it.
+// "+ New from example": copies one of /sd/pico-dev/examples into /sd/pico-dev/projects and opens it.
 static void newFromExample() {
   static char names[MAX_ITEMS][48];
   static const char *items[MAX_ITEMS];
@@ -453,6 +459,7 @@ static void newFromExample() {
   char name[33], src[160], dir[160];
   snprintf(name, sizeof name, "%s", names[i]);
   snprintf(src, sizeof src, EXAMPLES_DIR "/%s", names[i]);
+  mkdir(ROOT_DIR, 0777);
   mkdir(PROJECTS_DIR, 0777);
   for (;;) {
     if (!ui_input("New from example", "Project name:", name, sizeof name) || !name[0]) return;
@@ -477,19 +484,17 @@ static void pickProject() {
     snprintf(labels[n], sizeof labels[n], "+ New from example");
     paths[n][0] = 0;
     n++;
-    for (unsigned r = 0; r < sizeof kRoots / sizeof *kRoots; r++) {
-      DIR *d = opendir(kRoots[r]);
-      if (!d) continue;
+    if (DIR *d = opendir(PROJECTS_DIR)) {
       const int first = n;
       while (struct dirent *e = readdir(d)) {
         if (n == MAX_ITEMS || e->d_name[0] == '.') continue;
-        snprintf(paths[n], sizeof paths[n], "%s/%s", kRoots[r], e->d_name);
+        snprintf(paths[n], sizeof paths[n], PROJECTS_DIR "/%s", e->d_name);
         if (!isDir(paths[n])) continue;
-        snprintf(labels[n], sizeof labels[n], r ? "%s  (pico-dev)" : "%s", e->d_name);
+        snprintf(labels[n], sizeof labels[n], "%s", e->d_name);
         n++;
       }
       closedir(d);
-      // sort this root's projects by name (labels and paths together)
+      // sort the projects by name (labels and paths together)
       for (int i = first + 1; i < n; i++)
         for (int j = i; j > first && strcasecmp(labels[j - 1], labels[j]) > 0; j--) {
           char t[128];
@@ -506,7 +511,6 @@ static void pickProject() {
     if (i == -1) { if (s_ndocs) return; continue; }
     if (i == -2) {
       if (key == KEY_F9) { demo_run(); sdk_reset(); }
-      else if (key == KEY_F10 && (!anyModified() || closeProject())) sys_exit_to_loader();
       continue;
     }
     if (i <= 1) {
@@ -538,6 +542,7 @@ static void newFile() {
   if (!f) { ui_message("Can't create the file."); return; }
   fputs(header ? "#pragma once\n\n" : "#include <picocalc.h>\n\n", f);
   fclose(f);
+  ac_project(INCLUDE_DIR, s_proj);
   openFile(path);
 }
 
@@ -549,9 +554,10 @@ static void deleteFile(const char *name) {
   const int di = findDoc(path);
   if (di >= 0) closeDoc(di);
   if (remove(path)) ui_message("Can't delete the file.");
+  ac_project(INCLUDE_DIR, s_proj);
 }
 
-// F2: the project's files.
+// Esc in the editor: the project's files.
 static void pickFile() {
   static char names[MAX_ITEMS][64];
   static char labels[MAX_ITEMS][72];
@@ -587,12 +593,19 @@ static void pickFile() {
     char title[80];
     snprintf(title, sizeof title, "Files - %s", baseName(s_proj));
     int key = 0;
-    const int i = ui_list(title, items, n, &sel, "Enter: open  Del: delete  Esc: back", &key);
+    const bool unsaved = anyModified();   // F3 shown only when there is something to save
+    const int i = ui_list(title, items, n, &sel,
+                          unsaved ? "Enter: open  Del: delete  F3: save all  Esc: editor"
+                                  : "Enter: open  Del: delete  Esc: editor", &key);
     if (i == -1) return;
     if (i == 0) { pickProject(); return; }
     if (i == 1) { newFile(); return; }
     if (i == -2) {
       if (key == KEY_DEL && sel >= 2) deleteFile(names[sel]);
+      else if (key == KEY_F3 && unsaved) {
+        if (saveAll()) { setMsg(GREEN, "Saved"); cfgSave(); }
+        else ui_message(s_msg);
+      }
       continue;
     }
     openFile(names[i]);
@@ -605,14 +618,15 @@ static const char kHelp[] =
     "PicoCalc Studio\n"
     "\n"
     "F1   this help\n"
-    "F2   files of the project, other projects\n"
+    "F2   mark mode on/off (select with the arrows)\n"
     "F3   build (saves all files first)\n"
     "F4   build and run; Break stops the program\n"
     "F5   export /sd/apps/<project>.bin: a firmware\n"
     "     that runs the program, for PicoMultiLoader\n"
-    "F6   full build/program output\n"
-    "F7   mark mode on/off (same as Ctrl-Space)\n"
-    "Esc  clear the selection, else hide the output\n"
+    "F6   full build/program output (closing it also\n"
+    "     hides the output panel)\n"
+    "Esc  clear the selection, else the files of the\n"
+    "     project (Esc there: back to the editor)\n"
     "\n"
     "Editing\n"
     "Ctrl-S  save all     Ctrl-G  go to line\n"
@@ -624,10 +638,22 @@ static const char kHelp[] =
     "Ctrl-Home/End  start/end of the file\n"
     "Ctrl-Left/Right  previous/next word\n"
     "\n"
+    "Completion\n"
+    "Ctrl-Space lists the names that start with\n"
+    "the word before the cursor (all of them if\n"
+    "there is none). Up/Down choose, Tab or Enter\n"
+    "insert, Space inserts it and a space, Esc\n"
+    "closes; typing narrows the list.\n"
+    "The status bar shows the chosen name's\n"
+    "declaration. Names come from C, the headers\n"
+    "in /sd/pico-dev/include and the project's\n"
+    "files.\n"
+    "\n"
     "Selecting\n"
-    "Alt + arrows/Home/End/PgUp/PgDn select.\n"
-    "Or mark mode: F7 (or Ctrl-Space), move the\n"
-    "cursor, F7 again. The cursor is orange while\n"
+    "Alt + arrows/Home/End select. Shift-Up/Down\n"
+    "page; Alt-Shift-Up/Down select a page.\n"
+    "Or mark mode: F2, move the cursor, F2 again.\n"
+    "The cursor is orange while\n"
     "marking. Ctrl-A selects everything.\n"
     "Ctrl-C  copy         Ctrl-X  cut\n"
     "Ctrl-V  paste. With nothing selected, copy and\n"
@@ -636,9 +662,10 @@ static const char kHelp[] =
     "Typing replaces the selection. Tab/Alt-Tab\n"
     "indent/unindent the selected lines.\n"
     "\n"
-    "Projects are folders in /sd/projects. Every .c\n"
-    "file in the folder is compiled and linked. A\n"
-    "program has setup() and loop(), or main().\n"
+    "Projects are folders in /sd/pico-dev/projects.\n"
+    "Every .c file in the folder is compiled and\n"
+    "linked. A program has setup() and loop(), or\n"
+    "main().\n"
     "Headers: /sd/pico-dev/include (picocalc.h is the\n"
     "SDK). printf() output shows in the output panel.\n"
     "\n"
@@ -646,7 +673,9 @@ static const char kHelp[] =
     "line where it crashed.\n"
     "\n"
     "In the project list: \"+ New from example\"\n"
-    "copies an example, F9 SDK demo, F10 back to\n"
+    "copies an example, F9 SDK demo.\n"
+    "\n"
+    "F10 or Shift-F5, on any screen: back to\n"
     "PicoMultiLoader.\n";
 
 // Shows a text file (a header). Large ones are cut.
@@ -742,11 +771,17 @@ static void drawAll() {
   const int yEnd = UI_BAR_H + rows * UI_CH;
   gfx_fill_rect(0, yEnd, SCREEN_W, SCREEN_H - UI_BAR_H - yEnd, UI_BG);
   if (s_panel) drawPanel(SCREEN_H - UI_BAR_H - PANEL_ROWS * UI_CH - 4);
-  char pos[32];
-  snprintf(pos, sizeof pos, "%sLn %d Col %d", d && d->marking ? "MARK " : d && ed_has_sel(d) ? "SEL " : "",
-           d ? d->cy + 1 : 0, d ? d->cx + 1 : 0);
+  if (d) ac_draw(d, UI_BAR_H, rows);
+  // compact position, so the key hint (41 characters) fits beside it
+  char pos[24];
+  snprintf(pos, sizeof pos, "L%d C%d", d ? d->cy + 1 : 0, d ? d->cx + 1 : 0);
+  const char *hint = ac_hint();
+  const char *hintPos = hint && strlen(hint) > 40 ? nullptr : pos;   // a long declaration takes the whole bar
   if (s_msg[0]) ui_status(s_msg, pos, s_msgColor);
-  else ui_status("F1 help F2 files F3 build F4 run", pos, UI_DIM);
+  else if (ac_active()) ui_status(hint ? hint : "Tab/Enter/Space: insert  Esc: close", hint ? hintPos : pos, HINT_COLOR);
+  else if (d && d->marking) ui_status("MARK: move to select  F2 done  Esc cancel", pos, ORANGE);
+  else if (d && ed_has_sel(d)) ui_status("SEL: ^C copy ^X cut ^V paste  Esc clear", pos, UI_TEXT);
+  else ui_status("F1 help F2 mark F3 build F4 run Esc files", pos, UI_DIM);
   gfx_flush();
 }
 
@@ -754,7 +789,7 @@ static void updateBattery() {
   bool charging = false;
   const int pct = sys_battery(&charging);
   if (pct < 0) s_battery[0] = 0;
-  else snprintf(s_battery, sizeof s_battery, "%d%%%s", pct, charging ? "+" : "");
+  else snprintf(s_battery, sizeof s_battery, "Bat. %d%%%s", pct, charging ? "+" : "");
   s_batteryAt = sys_millis() + 20000;
 }
 
@@ -770,6 +805,17 @@ static int waitKey() {
 }
 
 static void onBreak() { longjmp(s_jmp, 1); }
+
+// F10 / Shift-F5 anywhere: back to PicoMultiLoader, offering to save changed files first.
+static void toLoader() {
+  if (anyModified()) {
+    const int a = ui_ask("Save changes before going to the loader? Y/N", "yn");
+    if (a == KEY_ESC) return;
+    if (a == 'y' && !saveAll()) { ui_message(s_msg); return; }
+  }
+  cfgSave();
+  sys_exit_to_loader();
+}
 
 // A one-line selection goes into buf (to search for it); otherwise buf is left alone.
 static void selectionText(Doc *d, char *buf, int size) {
@@ -816,17 +862,20 @@ static void replace(Doc *d, int rows) {
 static void command(int k) {
   Doc *d = cur();
   const int rows = editRows();
+  if (d && ac_key(d, k, rows)) return;   // the completion list takes it
   switch (k) {
     case KEY_F1: helpMenu(); break;
-    case KEY_F2: pickFile(); break;
+    case KEY_F2: if (d) ed_mark(d); break;
     case KEY_F3: { size_t size; free(build(&size)); break; }
     case KEY_F4: run(); break;
     case KEY_F5: exportApp(); break;
-    case KEY_F6: ui_text_view("Output", s_outLen ? s_out : "(no output yet)"); break;
-    case KEY_F7: if (d) ed_mark(d); break;
+    case KEY_F6:
+      ui_text_view("Output", s_outLen ? s_out : "(no output yet)");
+      s_panel = false;
+      break;
     case KEY_ESC:
       if (d && (d->marking || ed_has_sel(d))) ed_unselect(d);
-      else s_panel = false;
+      else pickFile();
       break;
     case 's' | UI_CTRL:
       if (saveAll()) setMsg(GREEN, "Saved");
@@ -845,8 +894,11 @@ static void command(int k) {
       if (s_find[0] && !ed_find(d, s_find, rows)) setMsg(YELLOW, "\"%s\" not found", s_find);
       break;
     case 'r' | UI_CTRL: replace(d, rows); break;
+    case ' ' | UI_CTRL:
+      if (d && !ac_open(s_docs, s_ndocs, d, rows)) setMsg(UI_DIM, "No names to complete");
+      break;
     default:
-      if (d) ed_key(d, k, rows);
+      if (d && ed_key(d, k, rows)) ac_after_key(d, k);
       break;
   }
 }
@@ -872,6 +924,7 @@ static void openCrash(const char *where, const char *why, const char *lastProj) 
 
 void ide_run(const char *crashWhere, const char *crashWhy) {
   sdk_set_exit_handler(onBreak);
+  ui_loader_hook = toLoader;
   updateBattery();
   {
     char proj[160], file[192];

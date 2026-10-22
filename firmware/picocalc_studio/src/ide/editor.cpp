@@ -309,14 +309,15 @@ void ed_unselect(Doc *d) {
 }
 
 bool ed_key(Doc *d, int key, int rows) {
-  // Alt selects: the keyboard doesn't report Shift reliably with the arrows. Shift is still taken.
+  // Only Alt selects: Shift+Up/Down is the keyboard's PgUp/PgDn, so Alt+Shift+Up/Down selects a
+  // page. Shift-Tab and Alt-Tab both unindent.
   const bool ctrl = key & UI_CTRL, shift = key & (UI_SHIFT | UI_ALT);
   const int k = key & 0xFF;
 
-  // movement: Alt/Shift (or mark mode) extends the selection
+  // movement: Alt (or mark mode) extends the selection
   if (k == KEY_LEFT || k == KEY_RIGHT || k == KEY_UP || k == KEY_DOWN || k == KEY_PGUP ||
       k == KEY_PGDN || k == KEY_HOME || k == KEY_END) {
-    const bool extend = shift || d->marking;
+    const bool extend = (key & UI_ALT) || d->marking;
     if (extend && !d->sel) { d->sel = true; d->ay = d->cy; d->ax = d->cx; }
     int y0, x0, y1, x1;
     if (!extend && !ctrl && selRange(d, &y0, &x0, &y1, &x1) && (k == KEY_LEFT || k == KEY_RIGHT)) {
@@ -335,7 +336,6 @@ bool ed_key(Doc *d, int key, int rows) {
   const DocLine *l = &d->ln[d->cy];
   if (ctrl) {
     switch (k) {
-      case ' ': ed_mark(d); return true;
       case 'z': doc_undo(d); break;
       case 'y': doc_redo(d); break;
       case 'a':

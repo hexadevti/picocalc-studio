@@ -20,15 +20,36 @@
 
 static CcObject *out;
 static Obj *current_fn;
-static int depth;          // bytes on the temporary push area
+static int depth;          // bytes on the temporary push area in memory
 static int return_label;
+
+// Callee-saved registers. Local scalars whose address is never taken live in the first ones
+// (by use count); the rest hold pushed temporaries (memory when they run out).
+static const int sregs[11] = {S1, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27};
+static const int fsregs[12] = {8, 9, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27};
+enum { MAX_VAR_REGS = 8 };
+static int nvar_x, nvar_f;     // registers taken by variables
+static int tmp_x, tmp_f;       // temporaries in use (from the top of the list down)
+static uint32_t used_x, used_f;  // registers that must be saved (bit = register number)
+
+// The push stack: where each pushed value is.
+typedef struct {
+  int8_t reg, reg2;  // register(s), or reg < 0: in memory
+  bool fp;
+  int mem;           // depth after a memory push
+} Slot;
+enum { MAX_SLOTS = 512 };
+static Slot slots[MAX_SLOTS];
+static int nslots;
 static HashMap label_map;  // chibicc label names -> asm labels (per function)
 static HashMap sym_map;    // symbol name -> index + 1
 static HashMap file_map;   // file name -> index + 1
 static int cur_line;
 
 static void gen_expr(Node *node);
+static void gen_void(Node *node);
 static void gen_stmt(Node *node);
+static bool const_int(Node *node, int64_t *v);
 
 int align_to(int n, int align) { return (n + align - 1) / align * align; }
 
@@ -42,7 +63,7 @@ static int sym_index(char *name) {
     return idx - 1;
   if (out->nsyms == out->capsyms) {
     int cap = out->capsyms ? out->capsyms * 2 : 64;
-    out->syms = cc_realloc(out->syms, sizeof(CcSym) * out->capsyms, sizeof(CcSym) * cap);
+    out->syms = cc_grow(out->syms, sizeof(CcSym) * out->capsyms, sizeof(CcSym) * cap);
     out->capsyms = cap;
   }
   int n = out->nsyms++;
@@ -54,7 +75,7 @@ static int sym_index(char *name) {
 static void data_reloc(uint32_t offset, int sym, int32_t addend) {
   if (out->nrelocs == out->caprelocs) {
     int cap = out->caprelocs ? out->caprelocs * 2 : 64;
-    out->relocs = cc_realloc(out->relocs, sizeof(CcReloc) * out->caprelocs, sizeof(CcReloc) * cap);
+    out->relocs = cc_grow(out->relocs, sizeof(CcReloc) * out->caprelocs, sizeof(CcReloc) * cap);
     out->caprelocs = cap;
   }
   out->relocs[out->nrelocs++] = (CcReloc){CC_DATA, offset, CC_R_ABS32, sym, addend, 0};
@@ -70,7 +91,7 @@ static void add_line(Token *tok) {
   if (!f) {
     if (out->nfiles == out->capfiles) {
       int cap = out->capfiles ? out->capfiles * 2 : 8;
-      out->files = cc_realloc(out->files, sizeof(char *) * out->capfiles, sizeof(char *) * cap);
+      out->files = cc_grow(out->files, sizeof(char *) * out->capfiles, sizeof(char *) * cap);
       out->capfiles = cap;
     }
     out->files[out->nfiles++] = name;
@@ -80,6 +101,8 @@ static void add_line(Token *tok) {
   cur_line = tok->line_no;
 
   uint32_t pc = asm_pc();
+  while (out->nlines && out->lines[out->nlines - 1].text_off > pc)  // a dropped jump
+    out->nlines--;
   if (out->nlines) {
     CcLine *last = &out->lines[out->nlines - 1];
     if (last->file == f - 1 && last->line == tok->line_no)
@@ -92,7 +115,7 @@ static void add_line(Token *tok) {
   }
   if (out->nlines == out->caplines) {
     int cap = out->caplines ? out->caplines * 2 : 256;
-    out->lines = cc_realloc(out->lines, sizeof(CcLine) * out->caplines, sizeof(CcLine) * cap);
+    out->lines = cc_grow(out->lines, sizeof(CcLine) * out->caplines, sizeof(CcLine) * cap);
     out->caplines = cap;
   }
   out->lines[out->nlines++] = (CcLine){pc, f - 1, tok->line_no};
@@ -146,47 +169,122 @@ static Type *arg_type(Type *ty) {
 // Push / pop
 //
 
+static void fmv_s(int fd, int fs) {
+  if (fd != fs)
+    rv_fp(0x10, fs, fs, 0, fd);  // fsgnj.s fd, fs, fs
+}
+
+static int take_x(void) {
+  if (nvar_x + tmp_x >= 11)
+    return -1;
+  int r = sregs[10 - tmp_x++];
+  used_x |= 1u << r;
+  return r;
+}
+
+static int take_f(void) {
+  if (nvar_f + tmp_f >= 12)
+    return -1;
+  int r = fsregs[11 - tmp_f++];
+  used_f |= 1u << r;
+  return r;
+}
+
+static Slot *new_slot(void) {
+  if (nslots == MAX_SLOTS)
+    error("expression too complex");
+  Slot *s = &slots[nslots++];
+  *s = (Slot){-1, -1, false, 0};
+  return s;
+}
+
 static void push(void) {
+  Slot *s = new_slot();
+  s->reg = take_x();
+  if (s->reg >= 0) {
+    rv_mv(s->reg, A0);
+    return;
+  }
   rv_addi(SP, SP, -4);
   rv_store(A0, SP, 0, 4);
   depth += 4;
-}
-
-static void pop(int reg) {
-  rv_load(reg, SP, 0, 4, 0);
-  rv_addi(SP, SP, 4);
-  depth -= 4;
+  s->mem = depth;
 }
 
 static void push_val(Type *ty) {
   if (is_flt(ty)) {
+    Slot *s = new_slot();
+    s->fp = true;
+    s->reg = take_f();
+    if (s->reg >= 0) {
+      fmv_s(s->reg, FA0);
+      return;
+    }
     rv_addi(SP, SP, -4);
     rv_fsw(FA0, SP, 0);
     depth += 4;
+    s->mem = depth;
   } else if (is_wide(ty)) {
+    Slot *s = new_slot();
+    if (nvar_x + tmp_x + 2 <= 11) {
+      s->reg = take_x();
+      s->reg2 = take_x();
+      rv_mv(s->reg, A0);
+      rv_mv(s->reg2, A1);
+      return;
+    }
     rv_addi(SP, SP, -8);
     rv_store(A0, SP, 0, 4);
     rv_store(A1, SP, 4, 4);
     depth += 8;
+    s->mem = depth;
   } else {
     push();
   }
 }
 
-// Pops a value of type ty into t0 (+t1) or ft0.
-static void pop_val(Type *ty) {
-  if (is_flt(ty)) {
-    rv_flw(FT0, SP, 0);
-    rv_addi(SP, SP, 4);
-    depth -= 4;
-  } else if (is_wide(ty)) {
-    rv_load(T0, SP, 0, 4, 0);
-    rv_load(T1, SP, 4, 4, 0);
-    rv_addi(SP, SP, 8);
-    depth -= 8;
-  } else {
-    pop(T0);
+// Pops a word; returns the register holding it (scratch if it was in memory). A register
+// stays valid until the next push.
+static int pop_reg(int scratch) {
+  Slot s = slots[--nslots];
+  if (s.reg >= 0) {
+    tmp_x--;
+    return s.reg;
   }
+  rv_load(scratch, SP, 0, 4, 0);
+  rv_addi(SP, SP, 4);
+  depth -= 4;
+  return scratch;
+}
+
+static void pop(int reg) { rv_mv(reg, pop_reg(reg)); }
+
+// Pops a float; returns the register holding it (scratch if it was in memory).
+static int pop_freg(int scratch) {
+  Slot s = slots[--nslots];
+  if (s.reg >= 0) {
+    tmp_f--;
+    return s.reg;
+  }
+  rv_flw(scratch, SP, 0);
+  rv_addi(SP, SP, 4);
+  depth -= 4;
+  return scratch;
+}
+
+// Pops a long long / double into lo:hi.
+static void pop_wide(int lo, int hi) {
+  Slot s = slots[--nslots];
+  if (s.reg >= 0) {
+    tmp_x -= 2;
+    rv_mv(lo, s.reg);
+    rv_mv(hi, s.reg2);
+    return;
+  }
+  rv_load(lo, SP, 0, 4, 0);
+  rv_load(hi, SP, 4, 4, 0);
+  rv_addi(SP, SP, 8);
+  depth -= 8;
 }
 
 //
@@ -262,53 +360,112 @@ static void load_bytes(int rd, int base, int off, int n, int align) {
   rv_mv(rd, T3);
 }
 
-// Loads a value of type ty from the address in a0.
-static void load(Type *ty) {
+// A memory location: base register + offset, or (sym >= 0) a symbol + offset reached with an
+// auipc pair.
+typedef struct {
+  int base;
+  int32_t off;
+  int sym;
+} Addr;
+
+static Addr base_addr(int base, int32_t off) { return (Addr){base, off, -1}; }
+
+// rd = the address
+static void addr_to(int rd, Addr a) {
+  if (a.sym >= 0)
+    rv_sym_addr(rd, a.sym, a.off, cur_line);
+  else if (a.off)
+    rv_addr(rd, a.base, a.off);
+  else
+    rv_mv(rd, a.base);
+}
+
+// Loads a value of type ty from a into the accumulator.
+static void load_from(Type *ty, Addr a) {
   switch (ty->kind) {
   case TY_ARRAY:
   case TY_STRUCT:
   case TY_UNION:
   case TY_FUNC:
   case TY_VLA:
+    addr_to(A0, a);
     return;
   case TY_FLOAT:
-    rv_flw(FA0, A0, 0);
+    if (a.sym >= 0) {
+      rv_sym_hi(T5, a.sym, a.off, cur_line);
+      rv_flw(FA0, T5, 0);
+    } else {
+      rv_flw(FA0, a.base, a.off);
+    }
     return;
   case TY_DOUBLE:
   case TY_LDOUBLE:
   case TY_LONG:
-    rv_load(A1, A0, 4, 4, 0);
-    rv_load(A0, A0, 0, 4, 0);
+    if (a.sym >= 0) {
+      addr_to(A0, a);
+      a = base_addr(A0, 0);
+    }
+    rv_load(A1, a.base, a.off + 4, 4, 0);
+    rv_load(A0, a.base, a.off, 4, 0);
     return;
   default:
-    rv_load(A0, A0, 0, ty->size, ty->is_unsigned);
+    if (a.sym >= 0) {
+      rv_sym_hi(A0, a.sym, a.off, cur_line);
+      a = base_addr(A0, 0);
+    }
+    rv_load(A0, a.base, a.off, ty->size, ty->is_unsigned);
   }
 }
 
-// Stores the accumulator to the address on top of the push area.
-static void store(Type *ty) {
-  pop(T2);
+// Loads a value of type ty from the address in a0.
+static void load(Type *ty) { load_from(ty, base_addr(A0, 0)); }
+
+// Stores the accumulator (a struct: the struct at the address in a0) to a.
+static void store_to(Type *ty, Addr a) {
   switch (ty->kind) {
   case TY_STRUCT:
   case TY_UNION:
+    addr_to(T2, a);
     copy_mem(T2, A0, ty->size, ty->align);
     return;
   case TY_FLOAT:
-    rv_fsw(FA0, T2, 0);
+    if (a.sym >= 0) {
+      rv_sym_hi(T2, a.sym, a.off, cur_line);
+      a = base_addr(T2, 0);
+    }
+    rv_fsw(FA0, a.base, a.off);
     return;
   case TY_DOUBLE:
   case TY_LDOUBLE:
   case TY_LONG:
-    rv_store(A0, T2, 0, 4);
-    rv_store(A1, T2, 4, 4);
+    if (a.sym >= 0) {
+      addr_to(T2, a);
+      a = base_addr(T2, 0);
+    }
+    rv_store(A0, a.base, a.off, 4);
+    rv_store(A1, a.base, a.off + 4, 4);
     return;
   default:
-    rv_store(A0, T2, 0, ty->size);
+    if (a.sym >= 0) {
+      rv_sym_hi(T2, a.sym, a.off, cur_line);
+      a = base_addr(T2, 0);
+    }
+    rv_store(A0, a.base, a.off, ty->size);
   }
 }
 
+// Stores the accumulator to the address on top of the push stack.
+static void store(Type *ty) { store_to(ty, base_addr(pop_reg(T2), 0)); }
+
 // Zeroes a local variable (slots are 4-byte aligned and padded to 4 bytes).
 static void zero_local(Obj *var) {
+  if (var->reg) {
+    if (is_flt(var->ty))
+      fmv_w_x(var->reg, ZERO);
+    else
+      rv_mv(var->reg, ZERO);
+    return;
+  }
   int n = align_to(var->ty->size, 4) / 4;
   if (n <= 16) {
     for (int i = 0; i < n; i++)
@@ -329,33 +486,94 @@ static void zero_local(Obj *var) {
 // Addresses
 //
 
-static void gen_addr(Node *node) {
+static Addr gen_lvalue(Node *node);
+static void gen_addr(Node *node);
+
+// Where the pointer expression e points (for an array: where the array is).
+static Addr ptr_base(Node *e) {
+  if (e->ty->kind == TY_ARRAY)
+    return gen_lvalue(e);
+  if (e->kind == ND_VAR && e->var->reg)
+    return base_addr(e->var->reg, 0);
+  gen_expr(e);
+  return base_addr(A0, 0);
+}
+
+// Evaluates an lvalue to a location, generating as little code as it can: a local in memory,
+// a member, a global or `*(p + constant)` cost nothing.
+static Addr gen_lvalue(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
     Obj *var = node->var;
+    if (var->reg)
+      error_tok(node->tok, "internal error: address of a register variable");
     if (var->is_local) {
-      if (var->ty->kind == TY_VLA || var->is_byref)
+      if (var->ty->kind == TY_VLA || var->is_byref) {
         rv_load(A0, S0, var->offset, 4, 0);
-      else
-        rv_addr(A0, S0, var->offset);
-      return;
+        return base_addr(A0, 0);
+      }
+      return base_addr(S0, var->offset);
     }
     if (var->is_tls)
       error_tok(node->tok, "thread-local variables are not supported");
-    rv_sym_addr(A0, sym_index(var->name), 0, cur_line);
-    return;
+    return (Addr){0, 0, sym_index(var->name)};
   }
-  case ND_DEREF:
-    gen_expr(node->lhs);
-    return;
+  case ND_MEMBER: {
+    Addr a = gen_lvalue(node->lhs);
+    a.off += node->member->offset;
+    return a;
+  }
+  case ND_DEREF: {
+    Node *e = node->lhs;
+    int64_t k;
+    if ((e->kind == ND_ADD || e->kind == ND_SUB) && e->lhs->ty->base && const_int(e->rhs, &k) &&
+        k > -(1 << 28) && k < (1 << 28)) {
+      Addr a = ptr_base(e->lhs);
+      a.off += e->kind == ND_ADD ? k : -k;
+      return a;
+    }
+    return ptr_base(e);
+  }
   case ND_COMMA:
-    gen_expr(node->lhs);
-    gen_addr(node->rhs);
-    return;
+    gen_void(node->lhs);
+    return gen_lvalue(node->rhs);
+  default:
+    gen_addr(node);
+    return base_addr(A0, 0);
+  }
+}
+
+// True if gen_lvalue(node) generates no code and gives a location that evaluating other
+// expressions does not change.
+static bool is_stable_lvalue(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+    return !node->var->reg && !(node->var->is_local && (node->var->ty->kind == TY_VLA || node->var->is_byref)) &&
+           !(!node->var->is_local && node->var->is_tls);
   case ND_MEMBER:
-    gen_addr(node->lhs);
-    if (node->member->offset)
-      rv_addr(A0, A0, node->member->offset);
+    return is_stable_lvalue(node->lhs);
+  case ND_DEREF: {
+    Node *e = node->lhs;
+    int64_t k;
+    if ((e->kind == ND_ADD || e->kind == ND_SUB) && e->lhs->ty->base && const_int(e->rhs, &k) &&
+        k > -(1 << 28) && k < (1 << 28))
+      e = e->lhs;
+    if (e->ty->kind == TY_ARRAY)
+      return is_stable_lvalue(e);
+    return e->kind == ND_VAR && e->var->reg;
+  }
+  default:
+    return false;
+  }
+}
+
+static void gen_addr(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+  case ND_MEMBER:
+  case ND_DEREF:
+  case ND_COMMA:
+    addr_to(A0, gen_lvalue(node));
     return;
   case ND_FUNCALL:
     if (node->ret_buffer) {
@@ -409,26 +627,28 @@ static int type_id(Type *ty) {
   }
 }
 
-// Re-extends a0 to the canonical 32-bit form of an integer type.
-static void narrow(int id) {
+// Re-extends r to the canonical 32-bit form of an integer type.
+static void narrow_reg(int r, int id) {
   switch (id) {
   case I8:
-    slli(A0, A0, 24);
-    srai(A0, A0, 24);
+    slli(r, r, 24);
+    srai(r, r, 24);
     break;
   case U8:
-    andi(A0, A0, 0xff);
+    andi(r, r, 0xff);
     break;
   case I16:
-    slli(A0, A0, 16);
-    srai(A0, A0, 16);
+    slli(r, r, 16);
+    srai(r, r, 16);
     break;
   case U16:
-    slli(A0, A0, 16);
-    srli(A0, A0, 16);
+    slli(r, r, 16);
+    srli(r, r, 16);
     break;
   }
 }
+
+static void narrow(int id) { narrow_reg(A0, id); }
 
 // a0 = (accumulator != 0)
 static void to_bool(Type *ty) {
@@ -544,6 +764,230 @@ static void cast(Type *from, Type *to) {
 }
 
 //
+// Constants and leaves
+//
+
+static int64_t normalize(int64_t v, Type *ty) {
+  if (ty->kind == TY_BOOL)
+    return v != 0;
+  switch (ty->size) {
+  case 1: return ty->is_unsigned ? (int64_t)(uint8_t)v : (int64_t)(int8_t)v;
+  case 2: return ty->is_unsigned ? (int64_t)(uint16_t)v : (int64_t)(int16_t)v;
+  case 4: return ty->is_unsigned ? (int64_t)(uint32_t)v : (int64_t)(int32_t)v;
+  default: return v;
+  }
+}
+
+// If node is an integer constant expression, stores its value in *v.
+static bool const_int(Node *node, int64_t *v) {
+  Type *ty = node->ty;
+  if (!ty || !(is_integer(ty) || ty->kind == TY_PTR))
+    return false;
+  int64_t a, b;
+  switch (node->kind) {
+  case ND_NUM:
+    a = node->val;
+    break;
+  case ND_CAST:
+    if (!const_int(node->lhs, &a))
+      return false;
+    break;
+  case ND_NEG:
+  case ND_BITNOT:
+    if (!const_int(node->lhs, &a))
+      return false;
+    a = node->kind == ND_NEG ? (int64_t)(0 - (uint64_t)a) : ~a;
+    break;
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_MOD:
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+  case ND_SHL:
+  case ND_SHR: {
+    if (!const_int(node->lhs, &a) || !const_int(node->rhs, &b))
+      return false;
+    Type *lt = node->lhs->ty;
+    bool u = lt->is_unsigned;
+    bool w = lt->size == 8;
+    switch (node->kind) {
+    case ND_ADD: a = (int64_t)((uint64_t)a + (uint64_t)b); break;
+    case ND_SUB: a = (int64_t)((uint64_t)a - (uint64_t)b); break;
+    case ND_MUL: a = (int64_t)((uint64_t)a * (uint64_t)b); break;
+    case ND_DIV:
+    case ND_MOD:
+      if (b == 0 || (!u && b == -1))
+        return false;
+      if (u && !w)
+        a = node->kind == ND_DIV ? (uint32_t)a / (uint32_t)b : (uint32_t)a % (uint32_t)b;
+      else if (u)
+        a = (int64_t)(node->kind == ND_DIV ? (uint64_t)a / (uint64_t)b : (uint64_t)a % (uint64_t)b);
+      else
+        a = node->kind == ND_DIV ? a / b : a % b;
+      break;
+    case ND_BITAND: a &= b; break;
+    case ND_BITOR: a |= b; break;
+    case ND_BITXOR: a ^= b; break;
+    case ND_SHL: a = (int64_t)((uint64_t)a << (b & (w ? 63 : 31))); break;
+    case ND_SHR:
+      if (u)
+        a = w ? (int64_t)((uint64_t)a >> (b & 63)) : (int64_t)((uint32_t)a >> (b & 31));
+      else
+        a = w ? a >> (b & 63) : (int64_t)((int32_t)a >> (b & 31));
+      break;
+    default: break;
+    }
+    break;
+  }
+  default:
+    return false;
+  }
+  *v = normalize(a, ty);
+  return true;
+}
+
+// Scalars of at most 32 bits: what a register variable or a leaf can be.
+static bool is_scalar32(Type *ty) {
+  switch (ty->kind) {
+  case TY_BOOL:
+  case TY_CHAR:
+  case TY_SHORT:
+  case TY_INT:
+  case TY_ENUM:
+  case TY_PTR:
+  case TY_FLOAT:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// Integer, pointer or float of at most 32 bits whose value is in a0 (not fa0).
+static bool is_int32(Type *ty) { return is_scalar32(ty) && !is_flt(ty); }
+
+// A cast that generates no code.
+static bool is_noop_cast(Type *from, Type *to) {
+  if (to->kind == TY_BOOL || to->kind == TY_VOID)
+    return false;
+  int t1 = type_id(from), t2 = type_id(to);
+  if (t1 == t2)
+    return true;
+  return (t2 == I32 || t2 == U32) && t1 != I64 && t1 != U64 && t1 != F32 && t1 != F64;
+}
+
+// The address of a variable, if it needs no code beyond one auipc pair or addi.
+static bool is_simple_var(Obj *var) {
+  if (var->is_local)
+    return var->ty->kind != TY_VLA && !var->is_byref;
+  return !var->is_tls;
+}
+
+// Leaves: values that can be computed straight into any register, with no temporaries
+// (only t5, and t0 for a float constant) and no side effects.
+static bool is_leaf(Node *node) {
+  switch (node->kind) {
+  case ND_NUM:
+    return is_scalar32(node->ty);
+  case ND_VAR: {
+    Obj *var = node->var;
+    if (var->reg)
+      return true;
+    if (!is_simple_var(var))
+      return false;
+    return node->ty->kind == TY_ARRAY || node->ty->kind == TY_FUNC || is_scalar32(node->ty);
+  }
+  case ND_ADDR:
+    return node->lhs->kind == ND_VAR && !node->lhs->var->reg && is_simple_var(node->lhs->var);
+  case ND_CAST:
+    return is_noop_cast(node->lhs->ty, node->ty) && is_leaf(node->lhs);
+  default:
+    return false;
+  }
+}
+
+static void gen_leaf(Node *node, int rd) {
+  switch (node->kind) {
+  case ND_NUM:
+    if (is_flt(node->ty)) {
+      float f = node->fval;
+      uint32_t u;
+      memcpy(&u, &f, 4);
+      if (u) {
+        rv_li(T0, u);
+        fmv_w_x(rd, T0);
+      } else {
+        fmv_w_x(rd, ZERO);
+      }
+    } else {
+      rv_li(rd, (int32_t)(uint32_t)node->val);
+    }
+    return;
+  case ND_VAR: {
+    Obj *var = node->var;
+    if (var->reg) {
+      if (is_flt(var->ty))
+        fmv_s(rd, var->reg);
+      else
+        rv_mv(rd, var->reg);
+      return;
+    }
+    Type *ty = node->ty;
+    if (ty->kind == TY_ARRAY || ty->kind == TY_FUNC) {
+      addr_to(rd, gen_lvalue(node));
+      return;
+    }
+    Addr a = gen_lvalue(node);
+    if (is_flt(ty)) {
+      if (a.sym >= 0) {
+        rv_sym_hi(T5, a.sym, a.off, cur_line);
+        a = base_addr(T5, 0);
+      }
+      rv_flw(rd, a.base, a.off);
+    } else {
+      if (a.sym >= 0) {
+        rv_sym_hi(rd, a.sym, a.off, cur_line);
+        a = base_addr(rd, 0);
+      }
+      rv_load(rd, a.base, a.off, ty->size, ty->is_unsigned);
+    }
+    return;
+  }
+  case ND_ADDR:
+    addr_to(rd, gen_lvalue(node->lhs));
+    return;
+  case ND_CAST:
+    gen_leaf(node->lhs, rd);
+    return;
+  default:
+    error_tok(node->tok, "internal error: not a leaf");
+  }
+}
+
+// The register holding a leaf's value: its own register, zero, or scratch.
+static int operand(Node *node, int scratch) {
+  while (node->kind == ND_CAST)
+    node = node->lhs;
+  if (node->kind == ND_VAR && node->var->reg)
+    return node->var->reg;
+  if (node->kind == ND_NUM && !is_flt(node->ty) && !node->val)
+    return ZERO;
+  gen_leaf(node, scratch);
+  return scratch;
+}
+
+// Evaluates node into the accumulator (or leaves it where it already is): the register
+// holding its value.
+static int gen_value(Node *node, int acc) {
+  if (is_leaf(node))
+    return operand(node, acc);
+  gen_expr(node);
+  return acc;
+}
+
+//
 // Calling convention
 //
 
@@ -634,8 +1078,9 @@ static void gen_funcall(Node *node) {
   for (Node *a = node->args; a; a = a->next)
     nargs++;
 
-  Loc *locs = calloc(nargs + 1, sizeof(Loc));
-  int *tmp = calloc(nargs + 1, sizeof(int));
+  Loc *locs = cc_fn_calloc((nargs + 1) * sizeof(Loc));
+  int *slot = cc_fn_calloc((nargs + 1) * sizeof(int));  // push slot, -1: a leaf, -2: an aggregate in memory
+  int *mem = cc_fn_calloc((nargs + 1) * sizeof(int));   // depth after copying an aggregate
   AbiState st = {0};
   bool sret = node->ret_buffer && node->ty->size > 8;
   if (sret)
@@ -644,12 +1089,16 @@ static void gen_funcall(Node *node) {
   for (Node *a = node->args; a; a = a->next, i++)
     locs[i] = classify(&st, arg_type(a->ty), i >= nparams && fty->is_variadic);
 
-  int base_depth = depth;
+  int base_depth = depth, base_slots = nslots, base_x = tmp_x, base_f = tmp_f;
 
-  // Evaluate the arguments left to right onto the push area.
+  // Evaluate the arguments left to right onto the push stack; leaves are loaded last.
   i = 0;
   for (Node *a = node->args; a; a = a->next, i++) {
     Type *ty = arg_type(a->ty);
+    if (is_leaf(a) && !is_aggr(ty)) {
+      slot[i] = -1;
+      continue;
+    }
     gen_expr(a);
     if (is_byref_type(ty)) {
       int sz = align_to(ty->size, 8);
@@ -659,24 +1108,28 @@ static void gen_funcall(Node *node) {
       copy_mem(SP, A0, ty->size, ty->align);
       rv_mv(A0, SP);
       push();
+      slot[i] = nslots - 1;
     } else if (is_aggr(ty)) {
       int sz = align_to(ty->size, 4);
       rv_addi(SP, SP, -sz);
       depth += sz;
       copy_mem(SP, A0, ty->size, ty->align);
+      slot[i] = -2;
+      mem[i] = depth;
     } else {
       push_val(ty);
+      slot[i] = nslots - 1;
     }
-    tmp[i] = depth;
   }
 
   bool direct = node->lhs->kind == ND_VAR && node->lhs->var->ty->kind == TY_FUNC &&
                 !node->lhs->var->is_local;
-  int fn_tmp = 0;
-  if (!direct) {
+  bool fn_leaf = !direct && is_leaf(node->lhs);
+  int fn_slot = -1;
+  if (!direct && !fn_leaf) {
     gen_expr(node->lhs);
     push();
-    fn_tmp = depth;
+    fn_slot = nslots - 1;
   }
 
   // Outgoing stack arguments at the new sp, which is 16-byte aligned.
@@ -687,34 +1140,101 @@ static void gen_funcall(Node *node) {
     depth += area;
   }
 
+  // Pushed arguments
   i = 0;
   for (Node *a = node->args; a; a = a->next, i++) {
-    int src = depth - tmp[i];
+    if (slot[i] == -1)
+      continue;
     Loc l = locs[i];
     Type *ty = arg_type(a->ty);
-    int words = is_byref_type(ty) ? 1 : align_to(ty->size, 4) / 4;
+    if (slot[i] == -2 || slots[slot[i]].reg < 0) {
+      int src = depth - (slot[i] == -2 ? mem[i] : slots[slot[i]].mem);
+      int words = is_byref_type(ty) ? 1 : align_to(ty->size, 4) / 4;
+      switch (l.kind) {
+      case L_STACK:
+        for (int w = 0; w < words; w++) {
+          rv_load(T0, SP, src + 4 * w, 4, 0);
+          rv_store(T0, SP, l.off + 4 * w, 4);
+        }
+        break;
+      case L_SPLIT:
+        rv_load(T0, SP, src + 4, 4, 0);
+        rv_store(T0, SP, l.off, 4);
+        rv_load(A7, SP, src, 4, 0);
+        break;
+      case L_GPR:
+        rv_load(A0 + l.reg, SP, src, 4, 0);
+        break;
+      case L_GPR2:
+        rv_load(A0 + l.reg, SP, src, 4, 0);
+        rv_load(A0 + l.reg + 1, SP, src + 4, 4, 0);
+        break;
+      case L_FPR:
+        rv_flw(FA0 + l.reg, SP, src);
+        break;
+      }
+      continue;
+    }
+    Slot *s = &slots[slot[i]];
     switch (l.kind) {
     case L_STACK:
-      for (int w = 0; w < words; w++) {
-        rv_load(T0, SP, src + 4 * w, 4, 0);
-        rv_store(T0, SP, l.off + 4 * w, 4);
+      if (s->fp) {
+        rv_fsw(s->reg, SP, l.off);
+      } else {
+        rv_store(s->reg, SP, l.off, 4);
+        if (s->reg2 >= 0)
+          rv_store(s->reg2, SP, l.off + 4, 4);
       }
       break;
     case L_SPLIT:
-      rv_load(T0, SP, src + 4, 4, 0);
-      rv_store(T0, SP, l.off, 4);
-      rv_load(A7, SP, src, 4, 0);
+      rv_store(s->reg2, SP, l.off, 4);
+      rv_mv(A7, s->reg);
       break;
     case L_GPR:
-      rv_load(A0 + l.reg, SP, src, 4, 0);
+      if (s->fp)
+        fmv_x_w(A0 + l.reg, s->reg);
+      else
+        rv_mv(A0 + l.reg, s->reg);
       break;
     case L_GPR2:
-      rv_load(A0 + l.reg, SP, src, 4, 0);
-      rv_load(A0 + l.reg + 1, SP, src + 4, 4, 0);
+      rv_mv(A0 + l.reg, s->reg);
+      rv_mv(A0 + l.reg + 1, s->reg2);
       break;
     case L_FPR:
-      rv_flw(FA0 + l.reg, SP, src);
+      fmv_s(FA0 + l.reg, s->reg);
       break;
+    }
+  }
+
+  // Leaves
+  i = 0;
+  for (Node *a = node->args; a; a = a->next, i++) {
+    if (slot[i] != -1)
+      continue;
+    Loc l = locs[i];
+    bool f = is_flt(a->ty);
+    switch (l.kind) {
+    case L_STACK:
+      if (f) {
+        gen_leaf(a, FT0);
+        rv_fsw(FT0, SP, l.off);
+      } else {
+        rv_store(operand(a, T0), SP, l.off, 4);
+      }
+      break;
+    case L_GPR:
+      if (f) {
+        gen_leaf(a, FT0);
+        fmv_x_w(A0 + l.reg, FT0);
+      } else {
+        gen_leaf(a, A0 + l.reg);
+      }
+      break;
+    case L_FPR:
+      gen_leaf(a, FA0 + l.reg);
+      break;
+    default:
+      error_tok(a->tok, "internal error: leaf argument");
     }
   }
 
@@ -722,13 +1242,22 @@ static void gen_funcall(Node *node) {
     rv_addr(A0, S0, node->ret_buffer->offset);
   if (direct) {
     rv_call_sym(sym_index(node->lhs->var->name), cur_line);
+  } else if (fn_leaf) {
+    gen_leaf(node->lhs, T6);
+    jalr(RA, T6);
+  } else if (slots[fn_slot].reg >= 0) {
+    jalr(RA, slots[fn_slot].reg);
   } else {
-    rv_load(T6, SP, depth - fn_tmp, 4, 0);
+    rv_load(T6, SP, depth - slots[fn_slot].mem, 4, 0);
     jalr(RA, T6);
   }
 
-  rv_addr(SP, SP, depth - base_depth);
+  if (depth != base_depth)
+    rv_addr(SP, SP, depth - base_depth);
   depth = base_depth;
+  nslots = base_slots;
+  tmp_x = base_x;
+  tmp_f = base_f;
 
   Type *rt = node->ty;
   if (is_aggr(rt)) {
@@ -754,6 +1283,54 @@ static void gen_funcall(Node *node) {
 // Expressions
 //
 
+static bool fits12(int64_t v) { return v >= -2048 && v <= 2047; }
+
+static int log2_exact(uint32_t v) {
+  if (!v || (v & (v - 1)))
+    return -1;
+  int n = 0;
+  while (v >>= 1)
+    n++;
+  return n;
+}
+
+// Evaluates two 32-bit integer operands; *a and *b are the registers holding them (a0 or a
+// variable's register for lhs, t0 or a register for rhs).
+static void gen_operands(Node *lhs, Node *rhs, int *a, int *b) {
+  if (is_leaf(rhs)) {
+    *a = gen_value(lhs, A0);
+    *b = operand(rhs, T0);
+  } else if (is_leaf(lhs)) {
+    gen_expr(rhs);
+    *b = A0;
+    *a = operand(lhs, T0);
+  } else {
+    gen_expr(rhs);
+    push();
+    gen_expr(lhs);
+    *b = pop_reg(T0);
+    *a = A0;
+  }
+}
+
+// The same for floats (fa0 / ft0).
+static void gen_foperands(Node *lhs, Node *rhs, int *a, int *b) {
+  if (is_leaf(rhs)) {
+    *a = gen_value(lhs, FA0);
+    *b = operand(rhs, FT0);
+  } else if (is_leaf(lhs)) {
+    gen_expr(rhs);
+    *b = FA0;
+    *a = operand(lhs, FT0);
+  } else {
+    gen_expr(rhs);
+    push_val(rhs->ty);
+    gen_expr(lhs);
+    *b = pop_freg(FT0);
+    *a = FA0;
+  }
+}
+
 static void lt64(int alo, int ahi, int blo, int bhi, bool is_unsigned) {
   rv_op(0, is_unsigned ? 3 : 2, T2, ahi, bhi);  // hi <
   rv_op(0, 4, T3, ahi, bhi);
@@ -763,49 +1340,142 @@ static void lt64(int alo, int ahi, int blo, int bhi, bool is_unsigned) {
   rv_op(0, 6, A0, T2, T3);
 }
 
+// 32-bit integer operation with a constant rhs; false if there is no short form.
+static bool gen_binary_imm(Node *node, int64_t k) {
+  Node *lhs = node->lhs;
+  bool u = lhs->ty->is_unsigned;
+  int32_t imm = (int32_t)(uint32_t)k;
+  int sh = log2_exact((uint32_t)imm);
+  switch (node->kind) {
+  case ND_ADD:
+    if (!fits12(imm))
+      return false;
+    rv_addi(A0, gen_value(lhs, A0), imm);
+    return true;
+  case ND_SUB:
+    if (!fits12(-(int64_t)imm))
+      return false;
+    rv_addi(A0, gen_value(lhs, A0), -imm);
+    return true;
+  case ND_MUL:
+    if (sh < 0)
+      return false;
+    slli(A0, gen_value(lhs, A0), sh);
+    return true;
+  case ND_DIV:
+    if (!u || sh < 0)
+      return false;
+    srli(A0, gen_value(lhs, A0), sh);
+    return true;
+  case ND_MOD:
+    if (!u || sh < 0 || !fits12(imm - 1))
+      return false;
+    andi(A0, gen_value(lhs, A0), imm - 1);
+    return true;
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+    if (!fits12(imm))
+      return false;
+    rv_opi(node->kind == ND_BITAND ? 7 : node->kind == ND_BITOR ? 6 : 4, A0, gen_value(lhs, A0), imm);
+    return true;
+  case ND_SHL:
+    slli(A0, gen_value(lhs, A0), imm & 31);
+    return true;
+  case ND_SHR:
+    if (u)
+      srli(A0, gen_value(lhs, A0), imm & 31);
+    else
+      srai(A0, gen_value(lhs, A0), imm & 31);
+    return true;
+  case ND_EQ:
+  case ND_NE: {
+    if (imm && !fits12(-(int64_t)imm))
+      return false;
+    int a = gen_value(lhs, A0);
+    if (imm) {
+      rv_addi(A0, a, -imm);
+      a = A0;
+    }
+    if (node->kind == ND_EQ)
+      seqz(A0, a);
+    else
+      snez(A0, a);
+    return true;
+  }
+  case ND_LT:
+    if (!fits12(imm))
+      return false;
+    rv_opi(u ? 3 : 2, A0, gen_value(lhs, A0), imm);  // slti[u]
+    return true;
+  case ND_LE:
+    if (u ? (uint32_t)imm == 0xffffffffu : imm == INT32_MAX)
+      return false;
+    if (!fits12((int64_t)imm + 1))
+      return false;
+    rv_opi(u ? 3 : 2, A0, gen_value(lhs, A0), imm + 1);
+    return true;
+  default:
+    return false;
+  }
+}
+
 static void gen_binary(Node *node) {
   Type *ty = node->lhs->ty;
+  Node *lhs = node->lhs, *rhs = node->rhs;
+  int a, b;
 
   if (node->kind == ND_SHL || node->kind == ND_SHR) {
-    gen_expr(node->rhs);  // only the low word of the count matters
-    if (is_flt(node->rhs->ty) || is_dbl(node->rhs->ty))
+    if (is_flt(rhs->ty) || is_dbl(rhs->ty))
       error_tok(node->tok, "invalid operand");
-    push();
-    gen_expr(node->lhs);
-    pop(T0);
     if (is_i64(ty)) {
-      rv_mv(A2, T0);
+      // only the low word of the count matters
+      gen_expr(rhs);
+      push();
+      gen_expr(lhs);
+      pop(A2);
       libcall(node->kind == ND_SHL ? "__ashldi3" : ty->is_unsigned ? "__lshrdi3" : "__ashrdi3");
-    } else if (node->kind == ND_SHL) {
-      rv_op(0, 1, A0, A0, T0);
-    } else {
-      rv_op(ty->is_unsigned ? 0 : 0x20, 5, A0, A0, T0);
+      return;
     }
+    int64_t k;
+    if (const_int(rhs, &k) && gen_binary_imm(node, k))
+      return;
+    if (is_i64(rhs->ty)) {
+      gen_expr(rhs);
+      push();
+      gen_expr(lhs);
+      a = A0;
+      b = pop_reg(T0);
+    } else {
+      gen_operands(lhs, rhs, &a, &b);
+    }
+    if (node->kind == ND_SHL)
+      rv_op(0, 1, A0, a, b);
+    else
+      rv_op(ty->is_unsigned ? 0 : 0x20, 5, A0, a, b);
     return;
   }
 
-  gen_expr(node->rhs);
-  push_val(node->rhs->ty);
-  gen_expr(node->lhs);
-  pop_val(node->rhs->ty);
-
   if (is_flt(ty)) {
+    gen_foperands(lhs, rhs, &a, &b);
     switch (node->kind) {
-    case ND_ADD: rv_fp(0x00, FT0, FA0, 7, FA0); return;
-    case ND_SUB: rv_fp(0x04, FT0, FA0, 7, FA0); return;
-    case ND_MUL: rv_fp(0x08, FT0, FA0, 7, FA0); return;
-    case ND_DIV: rv_fp(0x0c, FT0, FA0, 7, FA0); return;
-    case ND_EQ: rv_fp(0x50, FT0, FA0, 2, A0); return;
-    case ND_NE: rv_fp(0x50, FT0, FA0, 2, A0); xori(A0, A0, 1); return;
-    case ND_LT: rv_fp(0x50, FT0, FA0, 1, A0); return;
-    case ND_LE: rv_fp(0x50, FT0, FA0, 0, A0); return;
+    case ND_ADD: rv_fp(0x00, b, a, 7, FA0); return;
+    case ND_SUB: rv_fp(0x04, b, a, 7, FA0); return;
+    case ND_MUL: rv_fp(0x08, b, a, 7, FA0); return;
+    case ND_DIV: rv_fp(0x0c, b, a, 7, FA0); return;
+    case ND_EQ: rv_fp(0x50, b, a, 2, A0); return;
+    case ND_NE: rv_fp(0x50, b, a, 2, A0); xori(A0, A0, 1); return;
+    case ND_LT: rv_fp(0x50, b, a, 1, A0); return;
+    case ND_LE: rv_fp(0x50, b, a, 0, A0); return;
     default: error_tok(node->tok, "invalid expression");
     }
   }
 
   if (is_dbl(ty)) {
-    rv_mv(A2, T0);
-    rv_mv(A3, T1);
+    gen_expr(rhs);
+    push_val(rhs->ty);
+    gen_expr(lhs);
+    pop_wide(A2, A3);
     switch (node->kind) {
     case ND_ADD: libcall("__adddf3"); return;
     case ND_SUB: libcall("__subdf3"); return;
@@ -821,6 +1491,18 @@ static void gen_binary(Node *node) {
 
   if (is_i64(ty)) {
     bool u = ty->is_unsigned;
+    gen_expr(rhs);
+    push_val(rhs->ty);
+    gen_expr(lhs);
+    if (node->kind == ND_DIV || node->kind == ND_MOD) {
+      pop_wide(A2, A3);
+      if (node->kind == ND_DIV)
+        libcall(u ? "__udivdi3" : "__divdi3");
+      else
+        libcall(u ? "__umoddi3" : "__moddi3");
+      return;
+    }
+    pop_wide(T0, T1);
     switch (node->kind) {
     case ND_ADD:
       rv_add(A0, A0, T0);
@@ -841,15 +1523,6 @@ static void gen_binary(Node *node) {
       rv_op(1, 0, A0, A0, T0);
       rv_add(A1, T2, T3);
       rv_add(A1, A1, T4);
-      return;
-    case ND_DIV:
-    case ND_MOD:
-      rv_mv(A2, T0);
-      rv_mv(A3, T1);
-      if (node->kind == ND_DIV)
-        libcall(u ? "__udivdi3" : "__divdi3");
-      else
-        libcall(u ? "__umoddi3" : "__moddi3");
       return;
     case ND_BITAND:
       rv_op(0, 7, A0, A0, T0);
@@ -885,35 +1558,308 @@ static void gen_binary(Node *node) {
     }
   }
 
-  bool u = ty->is_unsigned;
+  // 32-bit integers and pointers. A constant goes on the right of a commutative operator.
+  int64_t k;
   switch (node->kind) {
-  case ND_ADD: rv_add(A0, A0, T0); return;
-  case ND_SUB: rv_sub(A0, A0, T0); return;
-  case ND_MUL: rv_op(1, 0, A0, A0, T0); return;
-  case ND_DIV: rv_op(1, u ? 5 : 4, A0, A0, T0); return;
-  case ND_MOD: rv_op(1, u ? 7 : 6, A0, A0, T0); return;
-  case ND_BITAND: rv_op(0, 7, A0, A0, T0); return;
-  case ND_BITOR: rv_op(0, 6, A0, A0, T0); return;
-  case ND_BITXOR: rv_op(0, 4, A0, A0, T0); return;
-  case ND_EQ: rv_sub(A0, A0, T0); seqz(A0, A0); return;
-  case ND_NE: rv_sub(A0, A0, T0); snez(A0, A0); return;
-  case ND_LT: rv_op(0, u ? 3 : 2, A0, A0, T0); return;
-  case ND_LE: rv_op(0, u ? 3 : 2, A0, T0, A0); xori(A0, A0, 1); return;
+  case ND_ADD:
+  case ND_MUL:
+  case ND_BITAND:
+  case ND_BITOR:
+  case ND_BITXOR:
+  case ND_EQ:
+  case ND_NE:
+    if (const_int(lhs, &k) && !const_int(rhs, &k) && lhs->ty->size == rhs->ty->size) {
+      Node swapped = *node;
+      swapped.lhs = rhs;
+      swapped.rhs = lhs;
+      if (const_int(lhs, &k) && gen_binary_imm(&swapped, k))
+        return;
+    }
+    break;
+  default:
+    break;
+  }
+  if (const_int(rhs, &k) && gen_binary_imm(node, k))
+    return;
+
+  bool u = ty->is_unsigned;
+  gen_operands(lhs, rhs, &a, &b);
+  switch (node->kind) {
+  case ND_ADD: rv_add(A0, a, b); return;
+  case ND_SUB: rv_sub(A0, a, b); return;
+  case ND_MUL: rv_op(1, 0, A0, a, b); return;
+  case ND_DIV: rv_op(1, u ? 5 : 4, A0, a, b); return;
+  case ND_MOD: rv_op(1, u ? 7 : 6, A0, a, b); return;
+  case ND_BITAND: rv_op(0, 7, A0, a, b); return;
+  case ND_BITOR: rv_op(0, 6, A0, a, b); return;
+  case ND_BITXOR: rv_op(0, 4, A0, a, b); return;
+  case ND_EQ: rv_op(0, 4, A0, a, b); seqz(A0, A0); return;
+  case ND_NE: rv_op(0, 4, A0, a, b); snez(A0, A0); return;
+  case ND_LT: rv_op(0, u ? 3 : 2, A0, a, b); return;
+  case ND_LE: rv_op(0, u ? 3 : 2, A0, b, a); xori(A0, A0, 1); return;
   default: error_tok(node->tok, "invalid expression");
   }
 }
 
+// Branches to label if the value of node is nonzero (if_true) or zero.
+static void gen_cond(Node *node, int label, bool if_true) {
+  int64_t k;
+  switch (node->kind) {
+  case ND_NOT:
+    gen_cond(node->lhs, label, !if_true);
+    return;
+  case ND_LOGAND:
+  case ND_LOGOR: {
+    bool is_and = node->kind == ND_LOGAND;
+    if (is_and == if_true) {
+      // and: both must hold to jump; or: both must fail to fall through
+      int skip = asm_new_label();
+      gen_cond(node->lhs, skip, !if_true);
+      gen_cond(node->rhs, label, if_true);
+      asm_bind(skip);
+    } else {
+      gen_cond(node->lhs, label, if_true);
+      gen_cond(node->rhs, label, if_true);
+    }
+    return;
+  }
+  case ND_CAST:
+    if (node->ty->kind == TY_BOOL || is_noop_cast(node->lhs->ty, node->ty)) {
+      gen_cond(node->lhs, label, if_true);
+      return;
+    }
+    break;
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE: {
+    Type *ty = node->lhs->ty;
+    if (!is_int32(ty) || !is_int32(node->rhs->ty))
+      break;
+    bool u = ty->is_unsigned;
+    int a, b;
+    if (const_int(node->rhs, &k) && !k) {
+      a = gen_value(node->lhs, A0);
+      b = ZERO;
+    } else {
+      gen_operands(node->lhs, node->rhs, &a, &b);
+    }
+    switch (node->kind) {
+    case ND_EQ: rv_branch(if_true ? BEQ : BNE, a, b, label); return;
+    case ND_NE: rv_branch(if_true ? BNE : BEQ, a, b, label); return;
+    case ND_LT: rv_branch(if_true ? (u ? BLTU : BLT) : (u ? BGEU : BGE), a, b, label); return;
+    default: rv_branch(if_true ? (u ? BGEU : BGE) : (u ? BLTU : BLT), b, a, label); return;
+    }
+  }
+  default:
+    break;
+  }
+  if (const_int(node, &k)) {
+    if ((k != 0) == if_true)
+      rv_jump(label);
+    return;
+  }
+  if (is_int32(node->ty) && is_leaf(node)) {
+    rv_branch(if_true ? BNE : BEQ, operand(node, A0), ZERO, label);
+    return;
+  }
+  gen_expr(node);
+  branch_zero(node->ty, label, !if_true);
+}
+
+// Makes the last instruction, which computed the accumulator, write reg instead.
+static bool retarget(int reg, bool fp) {
+  uint32_t *p = asm_last_insn();
+  if (!p)
+    return false;
+  uint32_t insn = *p, op = insn & 0x7f, rd = insn >> 7 & 31;
+  if (fp) {
+    if (rd != FA0)
+      return false;
+    if (op != OP_LOADFP) {
+      if (op != OP_FP)
+        return false;
+      uint32_t f7 = insn >> 25;
+      if (f7 != 0x00 && f7 != 0x04 && f7 != 0x08 && f7 != 0x0c && f7 != 0x10 && f7 != 0x14 &&
+          f7 != 0x2c && f7 != 0x68 && f7 != 0x78)
+        return false;
+    }
+  } else {
+    if (rd != A0 || (op != OP_OP && op != OP_IMM && op != OP_LOAD && op != OP_LUI))
+      return false;
+  }
+  *p = (insn & ~(31u << 7)) | (uint32_t)reg << 7;
+  return true;
+}
+
+// Stores the 32-bit integer in rs to a.
+static void store_reg(int rs, Type *ty, Addr a) {
+  if (a.sym >= 0) {
+    rv_sym_hi(T2, a.sym, a.off, cur_line);
+    a = base_addr(T2, 0);
+  }
+  rv_store(rs, a.base, a.off, ty->size);
+}
+
+static void gen_assign(Node *node, bool is_void) {
+  Node *lhs = node->lhs, *rhs = node->rhs;
+  Type *ty = node->ty;
+
+  if (lhs->kind == ND_VAR && lhs->var->reg) {
+    int r = lhs->var->reg;
+    if (is_flt(ty)) {
+      if (is_leaf(rhs)) {
+        gen_leaf(rhs, r);
+        if (!is_void)
+          fmv_s(FA0, r);
+        return;
+      }
+      gen_expr(rhs);
+      if (!is_void || !retarget(r, true))
+        fmv_s(r, FA0);
+      return;
+    }
+    if (is_leaf(rhs)) {
+      gen_leaf(rhs, r);
+      if (!is_void)
+        rv_mv(A0, r);
+      return;
+    }
+    gen_expr(rhs);
+    if (!is_void || !retarget(r, false))
+      rv_mv(r, A0);
+    return;
+  }
+
+  if (lhs->kind == ND_MEMBER && lhs->member->is_bitfield) {
+    Member *mem = lhs->member;
+    if (mem->ty->size > 4)
+      error_tok(node->tok, "long long bit-fields are not supported");
+    gen_addr(lhs);
+    push();
+    gen_expr(rhs);
+    uint32_t mask = mem->bit_width == 32 ? 0xffffffffu : (1u << mem->bit_width) - 1;
+    rv_mv(T6, A0);  // the new value is the result
+    rv_li(T5, (int32_t)mask);
+    rv_op(0, 7, T4, A0, T5);
+    slli(T4, T4, mem->bit_offset);
+    Slot *s = &slots[nslots - 1];
+    if (s->reg >= 0)
+      rv_mv(A0, s->reg);
+    else
+      rv_load(A0, SP, 0, 4, 0);
+    load(mem->ty);
+    rv_li(T5, (int32_t)~(mask << mem->bit_offset));
+    rv_op(0, 7, A0, A0, T5);
+    rv_op(0, 6, A0, A0, T4);
+    store(ty);
+    rv_mv(A0, T6);
+    return;
+  }
+
+  if (is_void && is_int32(ty) && is_leaf(rhs) && is_stable_lvalue(lhs)) {
+    int r = operand(rhs, A0);
+    store_reg(r, ty, gen_lvalue(lhs));
+    return;
+  }
+
+  Addr a = gen_lvalue(lhs);
+  if (a.sym < 0 && a.base == A0) {
+    push();
+    gen_expr(rhs);
+    a.base = pop_reg(T2);
+  } else {
+    gen_expr(rhs);
+  }
+  store_to(ty, a);
+}
+
+static bool has_stmt_expr(Node *node) {
+  if (!node)
+    return false;
+  if (node->kind == ND_STMT_EXPR)
+    return true;
+  if (has_stmt_expr(node->lhs) || has_stmt_expr(node->rhs))
+    return true;
+  if (is_ctl_node(node))
+    return has_stmt_expr(node->cond) || has_stmt_expr(node->then) || has_stmt_expr(node->els);
+  if (node->kind == ND_FUNCALL)
+    for (Node *n = node->args; n; n = n->next)
+      if (has_stmt_expr(n))
+        return true;
+  return false;
+}
+
+// No code beyond reading variables.
+static bool is_pure(Node *node) {
+  int64_t k;
+  switch (node->kind) {
+  case ND_NUM:
+  case ND_VAR:
+    return true;
+  case ND_CAST:
+    return is_pure(node->lhs);
+  default:
+    return const_int(node, &k);
+  }
+}
+
+// Evaluates node for its side effects only.
+static void gen_void(Node *node) {
+  switch (node->kind) {
+  case ND_NULL_EXPR:
+  case ND_NUM:
+  case ND_VAR:
+    return;
+  case ND_CAST:
+    gen_void(node->lhs);
+    return;
+  case ND_COMMA: {
+    Node *l = node->lhs, *r = node->rhs;
+    // `T x = e;` is memzero x, x = e: a scalar needs only the assignment.
+    if (l->kind == ND_MEMZERO && r->kind == ND_ASSIGN && r->lhs->kind == ND_VAR &&
+        r->lhs->var == l->var && !is_aggr(l->var->ty) && l->var->ty->kind != TY_ARRAY) {
+      gen_void(r);
+      return;
+    }
+    gen_void(l);
+    gen_void(r);
+    return;
+  }
+  case ND_ADD:
+  case ND_SUB:
+    if (is_pure(node->rhs)) {
+      gen_void(node->lhs);
+      return;
+    }
+    break;
+  case ND_ASSIGN:
+    gen_assign(node, true);
+    return;
+  case ND_MEMZERO:
+    zero_local(node->var);
+    return;
+  default:
+    break;
+  }
+  gen_expr(node);
+}
+
 static void gen_expr(Node *node) {
+  int64_t k;
+  if (node->kind != ND_NUM && const_int(node, &k)) {
+    rv_li(A0, (int32_t)(uint32_t)k);
+    if (is_i64(node->ty))
+      rv_li(A1, (int32_t)(uint32_t)((uint64_t)k >> 32));
+    return;
+  }
+
   switch (node->kind) {
   case ND_NULL_EXPR:
     return;
   case ND_NUM: {
     if (is_flt(node->ty)) {
-      float f = node->fval;
-      uint32_t u;
-      memcpy(&u, &f, 4);
-      rv_li(A0, u);
-      fmv_w_x(FA0, A0);
+      gen_leaf(node, FA0);
     } else if (is_dbl(node->ty)) {
       double d = node->fval;
       uint64_t u;
@@ -929,6 +1875,10 @@ static void gen_expr(Node *node) {
     return;
   }
   case ND_NEG:
+    if (is_int32(node->ty) && is_int32(node->lhs->ty)) {
+      rv_sub(A0, ZERO, gen_value(node->lhs, A0));
+      return;
+    }
     gen_expr(node->lhs);
     if (is_flt(node->ty)) {
       rv_fp(0x10, FA0, FA0, 1, FA0);  // fsgnjn.s fa0, fa0, fa0
@@ -945,12 +1895,17 @@ static void gen_expr(Node *node) {
     }
     return;
   case ND_VAR:
-    gen_addr(node);
-    load(node->ty);
+    if (node->var->reg) {
+      if (is_flt(node->ty))
+        fmv_s(FA0, node->var->reg);
+      else
+        rv_mv(A0, node->var->reg);
+      return;
+    }
+    load_from(node->ty, gen_lvalue(node));
     return;
   case ND_MEMBER: {
-    gen_addr(node);
-    load(node->ty);
+    load_from(node->ty, gen_lvalue(node));
     Member *mem = node->member;
     if (mem->is_bitfield) {
       if (mem->ty->size > 4)
@@ -964,42 +1919,27 @@ static void gen_expr(Node *node) {
     return;
   }
   case ND_DEREF:
-    gen_expr(node->lhs);
-    load(node->ty);
+    load_from(node->ty, gen_lvalue(node));
     return;
   case ND_ADDR:
     gen_addr(node->lhs);
     return;
   case ND_ASSIGN:
-    gen_addr(node->lhs);
-    push();
-    gen_expr(node->rhs);
-    if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield) {
-      Member *mem = node->lhs->member;
-      if (mem->ty->size > 4)
-        error_tok(node->tok, "long long bit-fields are not supported");
-      uint32_t mask = mem->bit_width == 32 ? 0xffffffffu : (1u << mem->bit_width) - 1;
-      rv_mv(T6, A0);  // the new value is the result
-      rv_li(T5, (int32_t)mask);
-      rv_op(0, 7, T4, A0, T5);
-      slli(T4, T4, mem->bit_offset);
-      rv_load(A0, SP, 0, 4, 0);
-      load(mem->ty);
-      rv_li(T5, (int32_t)~(mask << mem->bit_offset));
-      rv_op(0, 7, A0, A0, T5);
-      rv_op(0, 6, A0, A0, T4);
-      store(node->ty);
-      rv_mv(A0, T6);
-      return;
-    }
-    store(node->ty);
+    gen_assign(node, false);
     return;
   case ND_STMT_EXPR:
-    for (Node *n = node->body; n; n = n->next)
-      gen_stmt(n);
+    for (Node *n = node->body; n; n = n->next) {
+      if (!n->next && n->kind == ND_EXPR_STMT) {
+        if (n->tok)
+          add_line(n->tok);
+        gen_expr(n->lhs);
+      } else {
+        gen_stmt(n);
+      }
+    }
     return;
   case ND_COMMA:
-    gen_expr(node->lhs);
+    gen_void(node->lhs);
     gen_expr(node->rhs);
     return;
   case ND_CAST:
@@ -1011,8 +1951,7 @@ static void gen_expr(Node *node) {
     return;
   case ND_COND: {
     int els = asm_new_label(), end = asm_new_label();
-    gen_expr(node->cond);
-    branch_zero(node->cond->ty, els, true);
+    gen_cond(node->cond, els, false);
     gen_expr(node->then);
     rv_jump(end);
     asm_bind(els);
@@ -1021,11 +1960,19 @@ static void gen_expr(Node *node) {
     return;
   }
   case ND_NOT:
+    if (is_int32(node->lhs->ty)) {
+      seqz(A0, gen_value(node->lhs, A0));
+      return;
+    }
     gen_expr(node->lhs);
     to_bool(node->lhs->ty);
     xori(A0, A0, 1);
     return;
   case ND_BITNOT:
+    if (is_int32(node->ty)) {
+      xori(A0, gen_value(node->lhs, A0), -1);
+      return;
+    }
     gen_expr(node->lhs);
     xori(A0, A0, -1);
     if (is_i64(node->ty))
@@ -1033,16 +1980,12 @@ static void gen_expr(Node *node) {
     return;
   case ND_LOGAND:
   case ND_LOGOR: {
-    bool is_and = node->kind == ND_LOGAND;
-    int skip = asm_new_label(), end = asm_new_label();
-    gen_expr(node->lhs);
-    branch_zero(node->lhs->ty, skip, is_and);
-    gen_expr(node->rhs);
-    branch_zero(node->rhs->ty, skip, is_and);
-    rv_li(A0, is_and ? 1 : 0);
+    int f = asm_new_label(), end = asm_new_label();
+    gen_cond(node, f, false);
+    rv_li(A0, 1);
     rv_jump(end);
-    asm_bind(skip);
-    rv_li(A0, is_and ? 0 : 1);
+    asm_bind(f);
+    rv_li(A0, 0);
     asm_bind(end);
     return;
   }
@@ -1102,32 +2045,41 @@ static void gen_stmt(Node *node) {
 
   switch (node->kind) {
   case ND_IF: {
-    int els = asm_new_label(), end = asm_new_label();
-    gen_expr(node->cond);
-    branch_zero(node->cond->ty, els, true);
+    int els = asm_new_label();
+    gen_cond(node->cond, els, false);
     gen_stmt(node->then);
-    rv_jump(end);
-    asm_bind(els);
-    if (node->els)
+    if (node->els) {
+      int end = asm_new_label();
+      rv_jump(end);
+      asm_bind(els);
       gen_stmt(node->els);
-    asm_bind(end);
+      asm_bind(end);
+    } else {
+      asm_bind(els);
+    }
     return;
   }
   case ND_FOR: {
-    int begin = asm_new_label();
     int brk = label_of(node->brk_label);
+    int body = asm_new_label();
     if (node->init)
       gen_stmt(node->init);
-    asm_bind(begin);
-    if (node->cond) {
-      gen_expr(node->cond);
-      branch_zero(node->cond->ty, brk, true);
-    }
+    // The test is at the bottom (and, as a guard, before the first iteration) unless it
+    // cannot be duplicated.
+    bool rotate = node->cond && !has_stmt_expr(node->cond);
+    if (rotate)
+      gen_cond(node->cond, brk, false);
+    asm_bind(body);
+    if (node->cond && !rotate)
+      gen_cond(node->cond, brk, false);
     gen_stmt(node->then);
     asm_bind(label_of(node->cont_label));
     if (node->inc)
-      gen_expr(node->inc);
-    rv_jump(begin);
+      gen_void(node->inc);
+    if (rotate)
+      gen_cond(node->cond, body, true);
+    else
+      rv_jump(body);
     asm_bind(brk);
     return;
   }
@@ -1136,15 +2088,18 @@ static void gen_stmt(Node *node) {
     asm_bind(begin);
     gen_stmt(node->then);
     asm_bind(label_of(node->cont_label));
-    gen_expr(node->cond);
-    branch_zero(node->cond->ty, begin, false);
+    gen_cond(node->cond, begin, true);
     asm_bind(label_of(node->brk_label));
     return;
   }
   case ND_SWITCH: {
-    gen_expr(node->cond);
     bool wide = is_i64(node->cond->ty);
-    for (Node *n = node->case_next; n; n = n->case_next) {
+    int r = A0;
+    if (wide)
+      gen_expr(node->cond);
+    else
+      r = gen_value(node->cond, A0);
+    for (Node *n = node->cases; n; n = n->case_next) {
       int l = label_of(n->label);
       if (wide) {
         if (n->begin != n->end)
@@ -1156,18 +2111,23 @@ static void gen_stmt(Node *node) {
         rv_op(0, 6, T0, T0, T1);
         rv_branch(BEQ, T0, ZERO, l);
       } else if (n->begin == n->end) {
-        rv_li(T0, (int32_t)n->begin);
-        rv_branch(BEQ, A0, T0, l);
+        if (n->begin) {
+          rv_li(T0, (int32_t)n->begin);
+          rv_branch(BEQ, r, T0, l);
+        } else {
+          rv_branch(BEQ, r, ZERO, l);
+        }
       } else {
         rv_li(T0, (int32_t)n->begin);
-        rv_sub(T1, A0, T0);
+        rv_sub(T1, r, T0);
         rv_li(T0, (int32_t)(n->end - n->begin));
         rv_branch(BGEU, T0, T1, l);
       }
     }
     if (node->default_case)
       rv_jump(label_of(node->default_case->label));
-    rv_jump(label_of(node->brk_label));
+    else
+      rv_jump(label_of(node->brk_label));
     gen_stmt(node->then);
     asm_bind(label_of(node->brk_label));
     return;
@@ -1201,7 +2161,11 @@ static void gen_stmt(Node *node) {
             load_bytes(A1, A0, 4, ty->size - 4, ty->align);
           load_bytes(A0, A0, 0, ty->size < 4 ? ty->size : 4, ty->align);
         } else {
-          rv_load(T2, S0, current_fn->params->offset, 4, 0);  // hidden pointer
+          Obj *p = current_fn->params;  // the hidden pointer
+          if (p->reg)
+            rv_mv(T2, p->reg);
+          else
+            rv_load(T2, S0, p->offset, 4, 0);
           copy_mem(T2, A0, ty->size, ty->align);
           rv_mv(A0, T2);
         }
@@ -1210,7 +2174,7 @@ static void gen_stmt(Node *node) {
     rv_jump(return_label);
     return;
   case ND_EXPR_STMT:
-    gen_expr(node->lhs);
+    gen_void(node->lhs);
     return;
   case ND_ASM:
     error_tok(node->tok, "inline assembly is not supported");
@@ -1220,26 +2184,146 @@ static void gen_stmt(Node *node) {
 }
 
 //
+// Register allocation
+//
+
+static bool fn_setjmp, fn_alloca;
+
+static void mark_addr(Node *node) {
+  switch (node->kind) {
+  case ND_VAR:
+    node->var->addr_taken = true;
+    return;
+  case ND_MEMBER:
+    mark_addr(node->lhs);
+    return;
+  case ND_COMMA:
+    mark_addr(node->rhs);
+    return;
+  default:
+    return;
+  }
+}
+
+static void scan(Node *node, int w);
+
+static void scan_list(Node *node, int w) {
+  for (; node; node = node->next)
+    scan(node, w);
+}
+
+// Counts the uses of local variables (weighted by loop nesting) and finds the ones whose
+// address is taken.
+static void scan(Node *node, int w) {
+  if (!node)
+    return;
+  switch (node->kind) {
+  case ND_VAR:
+    if (node->var->is_local)
+      node->var->uses += w;
+    break;
+  case ND_ADDR:
+    mark_addr(node->lhs);
+    break;
+  case ND_ASSIGN:
+    if (node->lhs->kind != ND_VAR)
+      mark_addr(node->lhs);
+    break;
+  case ND_FUNCALL:
+    if (node->lhs->kind == ND_VAR) {
+      char *name = node->lhs->var->name;
+      if (!strcmp(name, "setjmp") || !strcmp(name, "_setjmp") || !strcmp(name, "sigsetjmp") ||
+          !strcmp(name, "__builtin_setjmp"))
+        fn_setjmp = true;
+      if (!strcmp(name, "alloca"))
+        fn_alloca = true;
+    }
+    break;
+  case ND_FOR:
+  case ND_DO:
+    scan(node->init, w);
+    if (w < (1 << 24))
+      w *= 8;
+    scan(node->cond, w);
+    scan(node->then, w);
+    scan(node->inc, w);
+    return;
+  default:
+    break;
+  }
+  scan(node->lhs, w);
+  scan(node->rhs, w);
+  if (is_ctl_node(node)) {
+    scan(node->cond, w);
+    scan(node->then, w);
+    scan(node->els, w);  // ND_FOR and ND_DO returned above; a switch's cases are inside then
+  } else if (node->kind == ND_BLOCK || node->kind == ND_STMT_EXPR) {
+    scan_list(node->body, w);
+  } else if (node->kind == ND_FUNCALL) {
+    scan_list(node->args, w);
+  } else if (node->kind == ND_CAS) {
+    scan(node->cas_addr, w);
+    scan(node->cas_old, w);
+    scan(node->cas_new, w);
+  }
+}
+
+static void alloc_regs(Obj *fn) {
+  for (Obj *var = fn->locals; var; var = var->next) {
+    var->uses = 0;
+    var->reg = 0;
+    var->addr_taken = false;
+  }
+  fn_setjmp = fn_alloca = false;
+  scan(fn->body, 1);
+  nvar_x = nvar_f = 0;
+  if (fn_setjmp)
+    return;
+  for (;;) {
+    Obj *best = NULL;
+    for (Obj *var = fn->locals; var; var = var->next) {
+      if (var->reg || var->addr_taken || var->is_byref || var->uses < 2 || !is_scalar32(var->ty) ||
+          var == fn->alloca_bottom || var == fn->va_area)
+        continue;
+      if (is_flt(var->ty) ? nvar_f == MAX_VAR_REGS : nvar_x == MAX_VAR_REGS)
+        continue;
+      if (!best || var->uses > best->uses)
+        best = var;
+    }
+    if (!best)
+      return;
+    best->reg = is_flt(best->ty) ? fsregs[nvar_f++] : sregs[nvar_x++];
+  }
+}
+
+//
 // Functions and data
 //
 
+static int popcount(uint32_t v) {
+  int n = 0;
+  for (; v; v &= v - 1)
+    n++;
+  return n;
+}
+
 static void emit_function(Obj *fn) {
   current_fn = fn;
-  label_map = (HashMap){0};
-  depth = 0;
   int va = fn->ty->is_variadic ? 32 : 0;
 
-  CcSym *sym = &out->syms[sym_index(fn->name)];
+  int sym_idx = sym_index(fn->name);  // may grow out->syms
+  CcSym *sym = &out->syms[sym_idx];
   sym->sect = CC_TEXT;
   sym->offset = asm_pc();
   sym->is_global = !fn->is_static;
   sym->line = fn->tok ? fn->tok->line_no : 0;
+  uint32_t start = sym->offset;
 
   // Parameter locations
   int nparams = 0;
   for (Obj *p = fn->params; p; p = p->next)
     nparams++;
-  Loc *locs = calloc(nparams + 1, sizeof(Loc));
+  Loc *locs = cc_fn_calloc((nparams + 1) * sizeof(Loc));
   AbiState st = {0};
   int i = 0;
   for (Obj *p = fn->params; p; p = p->next, i++) {
@@ -1247,75 +2331,165 @@ static void emit_function(Obj *fn) {
     p->is_byref = is_byref_type(p->ty);
   }
 
-  // Local slots (parameters included; stack-passed ones are overridden below)
-  int bottom = va + 8;
-  for (Obj *var = fn->locals; var; var = var->next) {
-    int size = var->is_byref ? 4 : var->ty->size;
-    int align = var->align > 4 ? var->align : 4;
-    bottom += align_to(size, 4);
-    bottom = align_to(bottom, align);
-    var->offset = -bottom;
-  }
-  int frame = align_to(bottom, 16);
+  alloc_regs(fn);
+  uint32_t var_x = 0, var_f = 0;
+  for (i = 0; i < nvar_x; i++)
+    var_x |= 1u << sregs[i];
+  for (i = 0; i < nvar_f; i++)
+    var_f |= 1u << fsregs[i];
 
-  // Prologue
-  if (fn->tok)
-    add_line(fn->tok);
-  rv_addi(SP, SP, -(va + 8));
-  rv_store(RA, SP, 4, 4);
-  rv_store(S0, SP, 0, 4);
-  for (int r = 0; r < 8 && va; r++)
-    rv_store(A0 + r, SP, 8 + 4 * r, 4);
-  rv_addi(S0, SP, va + 8);
-  if (frame > va + 8)
-    rv_addr(SP, SP, -(frame - va - 8));
-  rv_store(SP, S0, fn->alloca_bottom->offset, 4);
+  // Two passes: the first saves every callee-saved register and finds the ones used.
+  uint32_t save_x = 0, save_f = 0;
+  for (i = 0; i < 11; i++)
+    save_x |= 1u << sregs[i];
+  for (i = 0; i < 12; i++)
+    save_f |= 1u << fsregs[i];
+  int nlines = out->nlines;
+  CcLine last_line = nlines ? out->lines[nlines - 1] : (CcLine){0};
+  int line0 = cur_line;
+  asm_begin_function();
 
-  i = 0;
-  for (Obj *p = fn->params; p; p = p->next, i++) {
-    Loc l = locs[i];
-    switch (l.kind) {
-    case L_GPR:
-      rv_store(A0 + l.reg, S0, p->offset, 4);
-      break;
-    case L_GPR2:
-      rv_store(A0 + l.reg, S0, p->offset, 4);
-      rv_store(A0 + l.reg + 1, S0, p->offset + 4, 4);
-      break;
-    case L_FPR:
-      rv_fsw(FA0 + l.reg, S0, p->offset);
-      break;
-    case L_SPLIT:
-      rv_store(A7, S0, p->offset, 4);
-      rv_load(T0, S0, l.off, 4, 0);
-      rv_store(T0, S0, p->offset + 4, 4);
-      break;
-    case L_STACK:
-      p->offset = l.off;
-      break;
+  for (int pass = 0; pass < 2; pass++) {
+    label_map = (HashMap){.in_fn = true};
+    depth = 0;
+    nslots = 0;
+    tmp_x = tmp_f = 0;
+    used_x = var_x;
+    used_f = var_f;
+    int nsave = popcount(save_x) + popcount(save_f);
+
+    // Local slots (parameters included; stack-passed ones are overridden below)
+    int bottom = va + 8 + 4 * nsave;
+    for (Obj *var = fn->locals; var; var = var->next) {
+      if (var->reg)
+        continue;
+      int size = var->is_byref ? 4 : var->ty->size;
+      int align = var->align > 4 ? var->align : 4;
+      bottom += align_to(size, 4);
+      bottom = align_to(bottom, align);
+      var->offset = -bottom;
+    }
+    int frame = align_to(bottom, 16);
+
+    // Prologue
+    if (fn->tok)
+      add_line(fn->tok);
+    if (frame <= 2032) {
+      rv_addi(SP, SP, -frame);
+      rv_store(RA, SP, frame - va - 4, 4);
+      rv_store(S0, SP, frame - va - 8, 4);
+      for (int r = 0; r < 8 && va; r++)
+        rv_store(A0 + r, SP, frame - 32 + 4 * r, 4);
+      rv_addi(S0, SP, frame);
+    } else {
+      rv_addi(SP, SP, -(va + 8));
+      rv_store(RA, SP, 4, 4);
+      rv_store(S0, SP, 0, 4);
+      for (int r = 0; r < 8 && va; r++)
+        rv_store(A0 + r, SP, 8 + 4 * r, 4);
+      rv_addi(S0, SP, va + 8);
+      rv_addr(SP, SP, -(frame - va - 8));
+    }
+    int k = 0;
+    for (int r = 0; r < 32; r++)
+      if (save_x >> r & 1)
+        rv_store(r, S0, -va - 12 - 4 * k++, 4);
+    for (int r = 0; r < 32; r++)
+      if (save_f >> r & 1)
+        rv_fsw(r, S0, -va - 12 - 4 * k++);
+    if (fn_alloca)
+      rv_store(SP, S0, fn->alloca_bottom->offset, 4);
+
+    i = 0;
+    for (Obj *p = fn->params; p; p = p->next, i++) {
+      Loc l = locs[i];
+      if (p->reg) {
+        bool f = is_flt(p->ty);
+        switch (l.kind) {
+        case L_GPR:
+          if (f) {
+            fmv_w_x(p->reg, A0 + l.reg);
+          } else {
+            rv_mv(p->reg, A0 + l.reg);
+            narrow_reg(p->reg, type_id(p->ty));
+          }
+          break;
+        case L_FPR:
+          fmv_s(p->reg, FA0 + l.reg);
+          break;
+        case L_STACK:
+          p->offset = l.off;
+          if (f)
+            rv_flw(p->reg, S0, l.off);
+          else
+            rv_load(p->reg, S0, l.off, p->ty->size, p->ty->is_unsigned);
+          break;
+        default:
+          error("internal error: register parameter");
+        }
+        continue;
+      }
+      switch (l.kind) {
+      case L_GPR:
+        rv_store(A0 + l.reg, S0, p->offset, 4);
+        break;
+      case L_GPR2:
+        rv_store(A0 + l.reg, S0, p->offset, 4);
+        rv_store(A0 + l.reg + 1, S0, p->offset + 4, 4);
+        break;
+      case L_FPR:
+        rv_fsw(FA0 + l.reg, S0, p->offset);
+        break;
+      case L_SPLIT:
+        rv_store(A7, S0, p->offset, 4);
+        rv_load(T0, S0, l.off, 4, 0);
+        rv_store(T0, S0, p->offset + 4, 4);
+        break;
+      case L_STACK:
+        p->offset = l.off;
+        break;
+      }
+    }
+    if (fn->va_area)
+      fn->va_area->offset = st.gp < 8 ? -32 + 4 * st.gp : st.stack;
+
+    return_label = asm_new_label();
+    gen_stmt(fn->body);
+    if (depth != 0 || nslots != 0)
+      error("internal error: stack depth %d in %s", depth, fn->name);
+
+    // main() without a return statement returns 0.
+    if (!strcmp(fn->name, "main"))
+      rv_li(A0, 0);
+
+    // Epilogue (never touches memory below sp)
+    asm_bind(return_label);
+    rv_load(RA, S0, -va - 4, 4, 0);
+    k = 0;
+    for (int r = 0; r < 32; r++)
+      if (save_x >> r & 1)
+        rv_load(r, S0, -va - 12 - 4 * k++, 4, 0);
+    for (int r = 0; r < 32; r++)
+      if (save_f >> r & 1)
+        rv_flw(r, S0, -va - 12 - 4 * k++);
+    rv_load(T0, S0, -va - 8, 4, 0);
+    rv_mv(SP, S0);
+    rv_mv(S0, T0);
+    jalr(ZERO, RA);
+
+    if (pass == 0) {
+      save_x = used_x;
+      save_f = used_f;
+      asm_rollback();
+      out->nlines = nlines;
+      if (nlines)
+        out->lines[nlines - 1] = last_line;
+      cur_line = line0;
     }
   }
-  if (fn->va_area)
-    fn->va_area->offset = st.gp < 8 ? -32 + 4 * st.gp : st.stack;
-
-  return_label = asm_new_label();
-  gen_stmt(fn->body);
-  if (depth != 0)
-    error("internal error: stack depth %d in %s", depth, fn->name);
-
-  // main() without a return statement returns 0.
-  if (!strcmp(fn->name, "main"))
-    rv_li(A0, 0);
-
-  // Epilogue (never touches memory below sp)
-  asm_bind(return_label);
-  rv_load(RA, S0, -va - 4, 4, 0);
-  rv_load(T0, S0, -va - 8, 4, 0);
-  rv_mv(SP, S0);
-  rv_mv(S0, T0);
-  jalr(ZERO, RA);
   asm_end_function();
-  sym->size = asm_pc() - sym->offset;
+  sym = &out->syms[sym_idx];
+  sym->size = asm_pc() - start;
 }
 
 static bool all_zero(char *p, int n) {
@@ -1372,7 +2546,7 @@ static void emit_data(Obj *prog) {
   }
 }
 
-void codegen(Obj *prog, CcObject *o) {
+void codegen_begin(CcObject *o) {
   out = o;
   sym_map = (HashMap){0};
   file_map = (HashMap){0};
@@ -1381,9 +2555,17 @@ void codegen(Obj *prog, CcObject *o) {
   for (int i = CC_RODATA; i < CC_NSECT; i++)
     if (!o->sect[i].align)
       o->sect[i].align = 4;
+}
 
+// Compiles a function as soon as it has been parsed; its body is dropped afterwards.
+void codegen_function(Obj *fn) {
+  emit_function(fn);
+}
+
+// Static inline functions kept their bodies until it was known which are used.
+void codegen_end(Obj *prog) {
   emit_data(prog);
   for (Obj *fn = prog; fn; fn = fn->next)
-    if (fn->is_function && fn->is_definition && fn->is_live)
+    if (fn->is_function && fn->body && fn->is_live)
       emit_function(fn);
 }

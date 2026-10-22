@@ -23,8 +23,15 @@ static uint64_t fnv_hash(char *s, int len) {
   return hash;
 }
 
+// Buckets are grown arrays (see cc_grow()), so a rehash frees the old ones; a block scope's are
+// in the function arena, dropped with it.
+static HashEntry *new_buckets(HashMap *map, int cap) {
+  return map->in_fn ? cc_fn_calloc(sizeof(HashEntry) * cap) : cc_grow(NULL, 0, sizeof(HashEntry) * cap);
+}
+
 // Make room for new entires in a given hashmap by removing
 // tombstones and possibly extending the bucket size.
+
 static void rehash(HashMap *map) {
   // Compute the size of the new hashmap.
   int nkeys = 0;
@@ -38,8 +45,8 @@ static void rehash(HashMap *map) {
   assert(cap > 0);
 
   // Create a new hashmap and copy all key-values.
-  HashMap map2 = {};
-  map2.buckets = calloc(cap, sizeof(HashEntry));
+  HashMap map2 = {.in_fn = map->in_fn};
+  map2.buckets = new_buckets(map, cap);
   map2.capacity = cap;
 
   for (int i = 0; i < map->capacity; i++) {
@@ -49,6 +56,8 @@ static void rehash(HashMap *map) {
   }
 
   assert(map2.used == nkeys);
+  if (!map->in_fn)
+    cc_grow_free(map->buckets);
   *map = map2;
 }
 
@@ -75,7 +84,7 @@ static HashEntry *get_entry(HashMap *map, char *key, int keylen) {
 
 static HashEntry *get_or_insert_entry(HashMap *map, char *key, int keylen) {
   if (!map->buckets) {
-    map->buckets = calloc(INIT_SIZE, sizeof(HashEntry));
+    map->buckets = new_buckets(map, INIT_SIZE);
     map->capacity = INIT_SIZE;
   } else if ((map->used * 100) / map->capacity >= HIGH_WATERMARK) {
     rehash(map);

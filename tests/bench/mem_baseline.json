@@ -1,0 +1,54 @@
+{
+ "battery_mon": {
+  "peak": 786624,
+  "image": 4428
+ },
+ "crash_test": {
+  "peak": 852176,
+  "image": 3504
+ },
+ "filebrowser": {
+  "peak": 1376592,
+  "image": 6760
+ },
+ "hello": {
+  "peak": 589968,
+  "image": 1550
+ },
+ "keytest": {
+  "peak": 852176,
+  "image": 4567
+ },
+ "mandelbrot": {
+  "peak": 852176,
+  "image": 5772
+ },
+ "multi_file": {
+  "peak": 1507696,
+  "image": 3223
+ },
+ "paint": {
+  "peak": 983280,
+  "image": 5656
+ },
+ "snake": {
+  "peak": 1048832,
+  "image": 5458
+ },
+ "stress_alloc": {
+  "peak": 983280,
+  "image": 1987
+ },
+ "synth": {
+  "peak": 917728,
+  "image": 4077
+ },
+ "tetris": {
+  "peak": 1245488,
+  "image": 7957
+ },
+ "textedit_mini": {
+  "peak": 1245488,
+  "image": 8584
+ }
+}

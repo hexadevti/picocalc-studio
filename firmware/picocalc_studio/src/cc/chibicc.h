@@ -36,6 +36,27 @@ char *cc_strndup(const char *s, size_t n);
 char *cc_strdup(const char *s);
 void cc_arena_free(void);
 size_t cc_arena_used(void);
+size_t cc_arena_peak(void);  // most chunk memory held at once since cc_arena_free()
+// Scratch arena for the preprocessor: allocations between begin and end are dropped at end.
+void cc_scratch_begin(void);
+void cc_scratch_end(void);
+void *cc_tok_alloc(void);  // a zeroed Token, recycling freed scratch slots
+void cc_tok_free(void *p);
+bool cc_tok_track(bool on);  // record the tokens allocated from now on; returns the old setting
+void cc_tok_sweep(void);     // ...free the unmarked ones and stop
+void cc_fn_begin(void);  // allocate a function's Nodes and locals in their own arena...
+void cc_fn_end(void);    // ...and drop them
+bool cc_fn_is_open(void);
+typedef struct { void *chunk, *next; size_t used, total; } CcFnMark;
+CcFnMark cc_fn_mark(void);
+void cc_fn_release(CcFnMark m);  // drop what the function arena got since the mark
+void *cc_fn_calloc(size_t size);
+bool cc_fn_types(bool on);       // Types in the function arena too (while one is open); returns the old setting
+void *cc_type_calloc(size_t size);
+bool cc_in_fn_arena(void *p);
+void *cc_grow(void *p, size_t old_size, size_t new_size);
+void cc_grow_free(void *p);  // frees what cc_grow() allocated
+bool cc_keep(bool on);  // on: allocate in the main arena even inside a scratch section; returns the old setting
 
 #define calloc(n, size) cc_calloc((n), (size))
 #define strndup(s, n) cc_strndup((s), (n))
@@ -78,6 +99,7 @@ typedef enum {
   TK_NUM,     // Numeric literals
   TK_PP_NUM,  // Preprocessing numbers
   TK_EOF,     // End-of-file markers
+  TK_MORE,    // Rest of a lazily tokenized file (more()), or of the program (preprocess_more())
 } TokenKind;
 
 typedef struct {
@@ -88,29 +110,34 @@ typedef struct {
   // For #line directive
   char *display_name;
   int line_delta;
+
+  struct Token *after;  // what follows the file's last token (the includer's next token), or NULL
 } File;
 
 // Token type
 typedef struct Token Token;
+// Packed for the device (40 bytes on RV32, was 72): tokens are most of the compiler's memory.
 struct Token {
-  TokenKind kind;   // Token kind
   Token *next;      // Next token
-  int64_t val;      // If kind is TK_NUM, its value
-  double fval;      // If kind is TK_NUM, its value
   char *loc;        // Token location
-  int len;          // Token length
-  Type *ty;         // Used if TK_NUM or TK_STR
-  char *str;        // String literal contents including terminating '\0'
+  int len : 22;        // Token length
+  TokenKind kind : 6;  // Token kind
+  bool at_bol : 1;     // True if this token is at beginning of line
+  bool has_space : 1;  // True if this token follows a space character
+  bool pinned : 1;     // still referred to once its declaration is parsed (pin_token())
+  bool marked : 1;     // survives cc_tok_sweep()
 
   File *file;       // Source location
-  char *filename;   // Filename
-  int line_no;      // Line number
-  int line_delta;   // Line number
-  bool at_bol;      // True if this token is at beginning of line
-  bool has_space;   // True if this token follows a space character
+  int line_no;      // Line number (#line applied when the token leaves the preprocessor)
+  Type *ty;         // Used if TK_NUM or TK_STR
   Hideset *hideset; // For macro expansion
   Token *origin;    // If this is expanded from a macro, the original token
-  char *bad_literal; // unterminated literal: the error to report if it reaches the parser
+  union {
+    int64_t val;       // TK_NUM: integer value
+    double fval;       // TK_NUM: floating-point value
+    char *str;         // TK_STR: contents including terminating '\0'
+    char *bad_literal; // TK_PUNCT: unterminated literal, the error to report if it reaches the parser
+  };
 };
 
 noreturn void error(char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -125,7 +152,16 @@ File **get_input_files(void);
 File *new_file(char *name, int file_no, char *contents);
 Token *tokenize_string_literal(Token *tok, Type *basety);
 Token *tokenize(File *file);
-Token *tokenize_file(char *filename);
+Token *tokenize_line(File *file, char *p, int line);
+Token *tokenize_file(char *filename, Token *after);
+void tokenize_more(Token *tok);
+
+// Lexes the next chunk of the file if tok is where it stops (TK_MORE). Returns tok.
+static inline Token *more(Token *tok) {
+  while (tok->kind == TK_MORE)
+    tokenize_more(tok);
+  return tok;
+}
 void tokenize_reset(void);
 
 #define unreachable() \
@@ -140,6 +176,9 @@ void init_macros(void);
 void define_macro(char *name, char *buf);
 void undef_macro(char *name);
 Token *preprocess(Token *tok);
+Token *preprocess_more(Token *tok);
+void preprocess_release(Token *tok, Token *end, bool keep);
+void pin_token(Token *tok);
 void preprocess_reset(void);
 
 //
@@ -159,6 +198,9 @@ struct Obj {
   // Local variable
   int offset;
   bool is_byref;  // struct parameter passed by reference: the slot holds its address
+  int reg;        // code generator: register holding the variable (0 = in memory)
+  int uses;       // code generator: uses, weighted by loop nesting
+  bool addr_taken;
 
   // Global variable or function
   bool is_function;
@@ -250,6 +292,8 @@ typedef enum {
 } NodeKind;
 
 // AST node type
+// Shrunk for the device (56 bytes on RV32, was 160): each kind only uses the fields of one group,
+// so the groups share storage. Code that walks every child must switch on the kind (see add_type).
 struct Node {
   NodeKind kind; // Node kind
   Node *next;    // Next node
@@ -259,63 +303,77 @@ struct Node {
   Node *lhs;     // Left-hand side
   Node *rhs;     // Right-hand side
 
-  // "if" or "for" statement
-  Node *cond;
-  Node *then;
-  Node *els;
-  Node *init;
-  Node *inc;
+  union {
+    // ND_IF, ND_FOR, ND_DO, ND_SWITCH, ND_COND
+    struct {
+      Node *cond;
+      Node *then;
+      Node *els;
+      union {
+        Node *init;          // ND_FOR
+        Node *default_case;  // ND_SWITCH
+      };
+      union {
+        Node *inc;    // ND_FOR
+        Node *cases;  // ND_SWITCH: its ND_CASEs, linked by case_next
+      };
+      // "break" and "continue" labels
+      char *brk_label;
+      char *cont_label;
+    };
 
-  // "break" and "continue" labels
-  char *brk_label;
-  char *cont_label;
+    // ND_BLOCK, ND_STMT_EXPR
+    Node *body;
 
-  // Block or statement expression
-  Node *body;
+    // ND_MEMBER
+    Member *member;
 
-  // Struct member access
-  Member *member;
+    // ND_FUNCALL
+    struct {
+      Type *func_ty;
+      Node *args;
+      Obj *ret_buffer;
+    };
 
-  // Function call
-  Type *func_ty;
-  Node *args;
-  bool pass_by_stack;
-  Obj *ret_buffer;
+    // ND_GOTO, ND_LABEL, ND_LABEL_VAL, ND_CASE
+    struct {
+      char *label;
+      char *unique_label;
+      Node *goto_next;
+      Node *case_next;
+      int64_t begin;  // case range
+      int64_t end;
+    };
 
-  // Goto or labeled statement, or labels-as-values
-  char *label;
-  char *unique_label;
-  Node *goto_next;
+    // ND_ASM
+    char *asm_str;
 
-  // Switch
-  Node *case_next;
-  Node *default_case;
+    // ND_CAS
+    struct {
+      Node *cas_addr;
+      Node *cas_old;
+      Node *cas_new;
+    };
 
-  // Case
-  int64_t begin;
-  int64_t end;
+    // ND_VAR, ND_VLA_PTR, ND_MEMZERO
+    Obj *var;
 
-  // "asm" string literal
-  char *asm_str;
-
-  // Atomic compare-and-swap
-  Node *cas_addr;
-  Node *cas_old;
-  Node *cas_new;
-
-  // Atomic op= operators
-  Obj *atomic_addr;
-  Node *atomic_expr;
-
-  // Variable
-  Obj *var;
-
-  // Numeric literal
-  int64_t val;
-  double fval;
+    // ND_NUM
+    struct {
+      int64_t val;
+      double fval;
+    };
+  };
 };
 
+// The kinds that use the cond/then/els group.
+static inline bool is_ctl_node(Node *node) {
+  return node->kind == ND_IF || node->kind == ND_FOR || node->kind == ND_DO ||
+         node->kind == ND_SWITCH || node->kind == ND_COND;
+}
+
 Node *new_cast(Node *expr, Type *ty);
+Node *implicit_cast(Node *expr, Type *ty);
 int64_t const_expr(Token **rest, Token *tok);
 Obj *parse(Token *tok);
 void parse_reset(void);
@@ -343,12 +401,17 @@ typedef enum {
   TY_UNION,
 } TypeKind;
 
+// Shrunk for the device (40 bytes on RV32, was 68): the flags share a word with the kind and
+// the per-kind fields share storage, so read them only after checking the kind.
 struct Type {
-  TypeKind kind;
+  TypeKind kind : 8;
+  bool is_unsigned : 1;  // unsigned or signed
+  bool is_atomic : 1;    // true if _Atomic
+  bool is_flexible : 1;  // struct/union: ends in a flexible array member
+  bool is_packed : 1;    // struct/union
+  bool is_variadic : 1;  // function
   int size;           // sizeof() value
   int align;          // alignment
-  bool is_unsigned;   // unsigned or signed
-  bool is_atomic;     // true if _Atomic
   Type *origin;       // for type compatibility check
 
   // Pointer-to or array-of type. We intentionally use the same member
@@ -365,23 +428,26 @@ struct Type {
   Token *name;
   Token *name_pos;
 
-  // Array
-  int array_len;
+  union {
+    // Array
+    int array_len;
 
-  // Variable-length array
-  Node *vla_len; // # of elements
-  Obj *vla_size; // sizeof() value
+    // Variable-length array
+    struct {
+      Node *vla_len; // # of elements
+      Obj *vla_size; // sizeof() value
+    };
 
-  // Struct
-  Member *members;
-  bool is_flexible;
-  bool is_packed;
+    // Struct
+    Member *members;
 
-  // Function type
-  Type *return_ty;
-  Type *params;
-  bool is_variadic;
-  Type *next;
+    // Function type
+    struct {
+      Type *return_ty;
+      Type *params;
+    };
+  };
+  Type *next;  // function parameter list
 };
 
 // Struct member
@@ -424,6 +490,7 @@ bool is_flonum(Type *ty);
 bool is_numeric(Type *ty);
 bool is_compatible(Type *t1, Type *t2);
 Type *copy_type(Type *ty);
+Type *keep_type(Type *ty);
 Type *pointer_to(Type *base);
 Type *func_type(Type *return_ty);
 Type *array_of(Type *base, int size);
@@ -436,7 +503,9 @@ void add_type(Node *node);
 // codegen_rv32.c
 //
 
-void codegen(Obj *prog, CcObject *out);
+void codegen_begin(CcObject *out);
+void codegen_function(Obj *fn);
+void codegen_end(Obj *prog);
 int align_to(int n, int align);
 
 //
@@ -463,6 +532,7 @@ typedef struct {
   HashEntry *buckets;
   int capacity;
   int used;
+  bool in_fn;  // buckets in the function arena (a block scope's)
 } HashMap;
 
 void *hashmap_get(HashMap *map, char *key);
