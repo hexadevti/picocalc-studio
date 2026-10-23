@@ -1,12 +1,12 @@
 # build.ps1 - build a PicoCalc ESP32-P4 sketch with arduino-cli (same settings as pico-386) and copy
-# the app image to build\<name>\. It never uploads: `arduino-cli upload` would also write the
+# the app image to build\<name>_p4\. It never uploads: `arduino-cli upload` would also write the
 # bootloader and partition table and wipe PicoMultiLoader. Copy the .bin to the SD card and flash
 # it from the loader instead.
 #
 #   tools\build.ps1                                     # firmware\picocalc_studio
 #   tools\build.ps1 firmware\spikes\spike_p0 -ProbeSlot # also write <name>_slot.bin with the probe patched in
 #   tools\build.ps1 -Project hello                      # tests\projects\hello compiled into the firmware
-#                                                       # by gcc: build\picocalc_studio\hello.bin
+#                                                       # by gcc: build\picocalc_studio_p4\hello.bin
 param(
     [string]$Sketch = "firmware\picocalc_studio",
     [switch]$ProbeSlot,
@@ -17,7 +17,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $sketchDir = Join-Path $repo $Sketch
 $name = Split-Path -Leaf $sketchDir
 $buildPath = Join-Path $env:USERPROFILE ".picostudio-build\$name"   # short path: Windows 260-char limit
-$outDir = Join-Path $repo "build\$name"
+$outDir = Join-Path $repo "build\$name`_p4"
 $outName = $name
 
 # -Project: compile a test project's C sources into the firmware in place of the demo. They go to
