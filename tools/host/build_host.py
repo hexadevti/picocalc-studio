@@ -4,7 +4,7 @@ Build the host-side RV32 test tools in one go:
 
   build/host/rvsim.exe    RV32IMAFC emulator (tools/host/rvsim/rvsim.c, host gcc)
   build/host/simfw/*.o    guest runtime for it (tools/host/simfw, riscv32-esp-elf-gcc)
-  build/host/pcxrun.elf   .pcx module runner for rvsim (simfw/pcxrun.c + rt/pcx_load.c):
+  build/host/pcxrun.elf   .pcx module runner for rvsim (simfw/pcxrun.c + rt/pcx_load.c + rt/pcx_dbg.c):
                           rvsim --sd DIR build/host/pcxrun.elf /sd/prog.pcx [args...]
   build/host/pcc.exe      the PicoCalc C compiler (src/cc + pcc_main.c, host gcc):
                           pcc [-I dir] file.c... -o prog.pcx
@@ -53,11 +53,12 @@ RT_DIR = os.path.join(ROOT, "firmware", "picocalc_studio", "src", "rt")
 GEN_EXPORTS = os.path.join(ROOT, "tools", "gen_exports.py")
 PCXRUN_ELF = os.path.join(ROOT, "build", "host", "pcxrun-soft.elf" if simfw.SOFT else "pcxrun.elf")
 PCXRUN_DEPS = [os.path.join(HERE, "simfw", "pcxrun.c"), os.path.join(RT_DIR, "pcx_load.c"),
+               os.path.join(RT_DIR, "pcx_dbg.c"),
                os.path.join(RT_DIR, "pcx.h"), os.path.join(RT_DIR, "exports.txt"), GEN_EXPORTS]
 
 
 def build_pcxrun(force=False, verbose=False):
-    """build/host/pcxrun.elf: pcxrun.c + pcx_load.c + the exports.txt table, linked with simfw."""
+    """build/host/pcxrun.elf: pcxrun.c + pcx_load.c + pcx_dbg.c + the exports.txt table, linked with simfw."""
     objs = simfw.build_simfw(force, verbose)
     deps = PCXRUN_DEPS + [os.path.join(HERE, "simfw", d) for d in simfw.DEPS] + objs
     if (not force and os.path.exists(PCXRUN_ELF)
@@ -73,7 +74,8 @@ def build_pcxrun(force=False, verbose=False):
         raise RuntimeError("gen_exports.py --sim-out failed\n" + r.stdout + r.stderr)
     table_o = os.path.join(objdir, "pcxrun_exports.o")
     simfw._run([simfw.find_rv_gcc(), *simfw.ARCH, "-c", table, "-o", table_o])
-    simfw.link([os.path.join(HERE, "simfw", "pcxrun.c"), os.path.join(RT_DIR, "pcx_load.c"), table_o],
+    simfw.link([os.path.join(HERE, "simfw", "pcxrun.c"), os.path.join(RT_DIR, "pcx_load.c"),
+                os.path.join(RT_DIR, "pcx_dbg.c"), table_o],
                PCXRUN_ELF, ["-I", RT_DIR, "-Wall", "-Wextra", "-Werror"], objdir=objdir)
     return PCXRUN_ELF
 

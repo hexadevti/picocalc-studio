@@ -3,6 +3,8 @@
 // text = every object's text, in order. ram = all rodata, then all data (the initialized part,
 // data_size bytes), then all bss and the merged common symbols. Text-to-text references are
 // resolved here; references into ram or to firmware exports become load-time relocations.
+// Debug builds (cc_debug): the stop tables are joined, and __dbg_flags (one byte per stop point,
+// at the end of bss) is defined here; an object's stop i refers to its byte as __dbg_flags + i.
 #include "chibicc.h"
 #include "asm_rv32.h"
 #include "../rt/pcx.h"
@@ -218,6 +220,13 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
       ram += sz;
     }
   }
+  uint32_t nstops = 0, flags_off = ram;
+  uint32_t *stop_base = calloc(n ? n : 1, sizeof(uint32_t));
+  for (int i = 0; i < n; i++) {
+    stop_base[i] = nstops;
+    nstops += objs[i]->nstops;
+  }
+  ram += nstops;
   ram = align_up(ram, 4);
 
   // 3. Entries
@@ -248,6 +257,8 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
       CcReloc *rel = &o->relocs[r / CC_RELOC_BLOCK][r % CC_RELOC_BLOCK];
       CcSym *s = &o->syms[rel->sym];
       Target t = sym_target(i, s);
+      if (t.kind < 0 && nstops && !strcmp(s->name, "__dbg_flags"))
+        t = (Target){PCX_T_RAM, flags_off + stop_base[i]};
       if (t.kind < 0) {
         if (!opt->have_import || !opt->have_import(s->name))
           link_error(o, rel->sect == CC_TEXT ? rel->offset : UINT32_MAX, rel->line,
@@ -304,6 +315,15 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
     buf_put(&strtab, imports[i], strlen(imports[i]) + 1);
   }
 
+  Buf dbg = {0};
+  if (nstops) {
+    PcxDebug d = {PCX_DEBUG_MAGIC, nstops, flags_off};
+    buf_put(&dbg, &d, sizeof(d));
+    for (int i = 0; i < n; i++)
+      for (int k = 0; k < objs[i]->nstops; k++)
+        buf_u32(&dbg, sect_base[i][CC_TEXT] + objs[i]->stops[k]);
+  }
+
   // 6. Output
   PcxHeader h = {0};
   h.magic = PCX_MAGIC;
@@ -323,6 +343,9 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
 
   size_t total = sizeof(h) + text_size + data_size + imp.size + relocs.size + lines.size +
                  files.size + strtab.size;
+  uint32_t pad = (4 - total % 4) % 4;  // the debug trailer is 4-byte aligned
+  if (dbg.size)
+    total += pad + dbg.size;
   uint8_t *outp = cc_image_alloc(total);
   if (!outp)
     cc_out_of_memory("image", total);
@@ -336,6 +359,11 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
   PUT(lines.data, lines.size);
   PUT(files.data, files.size);
   PUT(strtab.data, strtab.size);
+  if (dbg.size) {
+    memset(p, 0, pad);
+    p += pad;
+    PUT(dbg.data, dbg.size);
+  }
 #undef PUT
   *image = outp;
   *size = total;

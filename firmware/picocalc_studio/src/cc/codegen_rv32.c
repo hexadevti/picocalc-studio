@@ -45,6 +45,8 @@ static HashMap label_map;  // chibicc label names -> asm labels (per function)
 static HashMap sym_map;    // symbol name -> index + 1
 static HashMap file_map;   // file name -> index + 1
 static int cur_line;
+static uint32_t dbg_stub;   // cc_debug: text offset of the object's stop stub
+static int stmt_expr_depth;  // statements in ({ ... }) get no stop point
 
 static void gen_expr(Node *node);
 static void gen_void(Node *node);
@@ -150,6 +152,78 @@ int cc_soft_float = 1;
 #else
 int cc_soft_float = 0;
 #endif
+int cc_debug;
+
+//
+// Debug builds: stop points (docs/DEBUGGER.md)
+//
+// Each statement starts with
+//   auipc t0, %hi(__dbg_flags + id); lbu t0, %lo(...)(t0); beqz t0, 1f; jal t0, stub; 1:
+// t0 is free at a statement start, and the jal links through it so that ra survives. The stub
+// saves every register in a PcxDbgRegs block (rt/pcx.h) on the stack, calls __pc_dbg_stop(regs)
+// and restores them all, so a stop changes nothing the program can see. The linker defines
+// __dbg_flags: one byte per stop point of the image.
+
+enum { DBG_FRAME_SOFT = 128, DBG_FRAME_HARD = 272 };  // sizeof(PcxDbgRegs), 16-byte aligned
+
+static void csr_fcsr(int f3, int rd, int rs) { emit32(3u << 20 | rs << 15 | f3 << 12 | rd << 7 | 0x73); }
+
+// At the start of the object's text: jal reaches it from anywhere in the object.
+static void emit_dbg_stub(void) {
+  static char stop_fn[] = "__pc_dbg_stop";
+  int frame = cc_soft_float ? DBG_FRAME_SOFT : DBG_FRAME_HARD;
+  dbg_stub = asm_pc();
+  // The stop point's sp need not be 16-byte aligned (temporaries), the call needs it.
+  rv_addi(SP, SP, -16);
+  rv_store(T1, SP, 0, 4);
+  rv_addi(T1, SP, 16);
+  rv_opi(7, SP, SP, -16);  // andi
+  rv_addi(SP, SP, -frame);
+  rv_store(T1, SP, 4 * SP, 4);  // x[2]: the stop point's sp
+  rv_load(T1, T1, -16, 4, 0);
+  for (int r = 1; r < 32; r++)
+    if (r != SP)
+      rv_store(r, SP, 4 * r, 4);
+  if (!cc_soft_float) {
+    for (int f = 0; f < 32; f++)
+      rv_fsw(f, SP, 128 + 4 * f);
+    csr_fcsr(2, T1, ZERO);  // frcsr t1
+    rv_store(T1, SP, 256, 4);
+  }
+  rv_mv(A0, SP);
+  rv_call_sym(sym_index(stop_fn), 0);
+  if (!cc_soft_float) {
+    rv_load(T1, SP, 256, 4, 0);
+    csr_fcsr(1, ZERO, T1);  // fscsr t1
+    for (int f = 0; f < 32; f++)
+      rv_flw(f, SP, 128 + 4 * f);
+  }
+  for (int r = 1; r < 32; r++)
+    if (r != SP)
+      rv_load(r, SP, 4 * r, 4, 0);
+  rv_load(SP, SP, 4 * SP, 4, 0);
+  rv_i(0, T0, 0, ZERO, OP_JALR);  // back to the stop point
+}
+
+static void stop_point(void) {
+  static char flags[] = "__dbg_flags";
+  if (!cc_debug || stmt_expr_depth)
+    return;
+  if (out->nstops == out->capstops) {
+    int cap = out->capstops ? out->capstops * 2 : 256;
+    out->stops = cc_grow(out->stops, sizeof(uint32_t) * out->capstops, sizeof(uint32_t) * cap);
+    out->capstops = cap;
+  }
+  int id = out->nstops;
+  out->stops[out->nstops++] = asm_pc();
+  rv_sym_hi(T0, sym_index(flags), id, cur_line);
+  rv_i(0, T0, 4, T0, OP_LOAD);                                // lbu t0, 0(t0)
+  emit32(T0 << 15 | BEQ << 12 | 8 << 7 | OP_BRANCH);          // beqz t0, +8
+  uint32_t d = dbg_stub - asm_pc();
+  emit32((d >> 20 & 1) << 31 | (d >> 1 & 0x3ff) << 21 | (d >> 11 & 1) << 20 | (d >> 12 & 0xff) << 12 |
+         T0 << 7 | OP_JAL);                                   // jal t0, stub
+  asm_bind(asm_new_label());  // nothing may rewrite the jal (asm_last_insn)
+}
 
 // is_flt: a float in an FP register (fa0, ft0, fs*). With cc_soft_float a float is a 32-bit
 // integer value in a0 instead, and is_sflt holds; its arithmetic calls libgcc.
@@ -1972,6 +2046,7 @@ static void gen_expr(Node *node) {
     gen_assign(node, false);
     return;
   case ND_STMT_EXPR:
+    stmt_expr_depth++;
     for (Node *n = node->body; n; n = n->next) {
       if (!n->next && n->kind == ND_EXPR_STMT) {
         if (n->tok)
@@ -1981,6 +2056,7 @@ static void gen_expr(Node *node) {
         gen_stmt(n);
       }
     }
+    stmt_expr_depth--;
     return;
   case ND_COMMA:
     gen_void(node->lhs);
@@ -2087,6 +2163,10 @@ static void gen_stmt(Node *node) {
   check_stack(node->tok);
   if (node->tok)
     add_line(node->tok);
+  // A block's statements, a packed statement and a labelled one get their own.
+  if (node->tok && node->kind != ND_BLOCK && node->kind != ND_PACKED && node->kind != ND_LABEL &&
+      node->kind != ND_CASE)
+    stop_point();
 
   switch (node->kind) {
   case ND_IF: {
@@ -2401,7 +2481,7 @@ static void emit_function(Obj *fn) {
     save_x |= 1u << sregs[i];
   for (i = 0; i < 12; i++)
     save_f |= 1u << fsregs[i];
-  int nlines = out->nlines;
+  int nlines = out->nlines, nstops = out->nstops;
   CcLine last_line = nlines ? out->lines[nlines - 1] : (CcLine){0};
   int line0 = cur_line;
   asm_begin_function();
@@ -2539,6 +2619,7 @@ static void emit_function(Obj *fn) {
       save_f = used_f;
       asm_rollback();
       out->nlines = nlines;
+      out->nstops = nstops;
       if (nlines)
         out->lines[nlines - 1] = last_line;
       cur_line = line0;
@@ -2623,10 +2704,13 @@ void codegen_begin(CcObject *o) {
   sym_map = (HashMap){0};
   file_map = (HashMap){0};
   cur_line = 0;
+  stmt_expr_depth = 0;
   asm_init(o);
   for (int i = CC_RODATA; i < CC_NSECT; i++)
     if (!o->sect[i].align)
       o->sect[i].align = 4;
+  if (cc_debug)
+    emit_dbg_stub();
 }
 
 // Compiles a function as soon as it has been parsed; its body is dropped afterwards.

@@ -139,6 +139,7 @@ __getreent
 __errno
 setjmp
 longjmp
+__pc_dbg_stop   # debug builds: what a stop point calls (docs/DEBUGGER.md)
 
 # libgcc: soft double, 64-bit integer division
 __adddf3

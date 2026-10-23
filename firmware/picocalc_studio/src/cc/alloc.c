@@ -711,6 +711,8 @@ static CcObject *keep_object(CcObject *o) {
   k->caplines = k->nlines;
   k->files = cc_grow_keep(k->files, sizeof(char *) * k->nfiles);
   k->capfiles = k->nfiles;
+  k->stops = cc_grow_keep(k->stops, sizeof(uint32_t) * k->nstops);
+  k->capstops = k->nstops;
   free_grown();
   return k;
 }

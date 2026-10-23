@@ -11,12 +11,23 @@
 #include <stdint.h>
 #include <stdio.h>
 
+// A breakpoint for a debug run: a source path (or its last components) and a 1-based line.
+struct RtBreakpoint {
+  const char *file;
+  int line;
+};
+
 struct RtRunOptions {
   int argc;
   char **argv;
   FILE *out;            // the program's stdout, or null for the console
   bool foreground;      // owns the screen, keys and sound: sdk_reset() before and after
   uint32_t timeout_ms;  // 0 = none
+  // Debug run (docs/DEBUGGER.md) of a debug build (cc_debug): stops at these breakpoints and on
+  // Break, showing the stopped view (rt/debugger.cpp). Ignored for other builds.
+  bool debug;
+  const RtBreakpoint *breakpoints;
+  int nbreakpoints;
 };
 
 enum RtEnd { RT_END_RETURN, RT_END_EXIT, RT_END_ABORT, RT_END_BREAK, RT_END_KILLED, RT_END_TIMEOUT, RT_END_BAD_FREE };

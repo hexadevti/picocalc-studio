@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define DOC_TAB 4
+#define DOC_MAX_BREAKS 16
 
 struct DocLine {
   char *s;                 // not NUL-terminated
@@ -39,6 +40,9 @@ struct Doc {
   // undo: u[0, nu) can be undone, u[nu, nt) redone
   DocUndo *u;
   int nu, nt, ucap, group;
+  // debugger breakpoints: line indexes, unordered; edits move them with their lines
+  int bp[DOC_MAX_BREAKS];
+  int nbp;
   bool parked;             // doc_park_all() freed the lines
   Doc *nextOpen;           // doc.cpp's list of open docs
 };
@@ -67,6 +71,10 @@ char *doc_get_text(const Doc *d, int y0, int x0, int y1, int x1, int *n);
 // Undo/redo one group; they move the cursor. False if there is nothing to undo/redo.
 bool doc_undo(Doc *d);
 bool doc_redo(Doc *d);
+
+// Sets or clears a breakpoint on line y; false if it was full.
+bool doc_toggle_break(Doc *d, int y);
+bool doc_has_break(const Doc *d, int y);
 
 // Leading spaces of line y.
 int doc_indent(const Doc *d, int y);

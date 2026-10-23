@@ -77,7 +77,9 @@ void ed_draw(Doc *d, int y0, int rows, int errLine) {
       if (b > a) gfx_fill_rect(ED_X0 + (a - d->left) * UI_CW, y, (b - a) * UI_CW, UI_CH, SEL_BG);
     }
     snprintf(buf, sizeof buf, "%4d", i + 1);
-    gfx_text(0, y, buf, i == d->cy ? RGB(230, 210, 120) : UI_DIM);
+    const bool bp = d->nbp && doc_has_break(d, i);
+    if (bp) gfx_fill_rect(0, y, ED_X0 - 3, UI_CH, RGB(150, 30, 30));
+    gfx_text(0, y, buf, bp ? RGB(255, 255, 255) : i == d->cy ? RGB(230, 210, 120) : UI_DIM);
     if (l->len > clsCap) {
       int cap = l->len + 64;
       uint8_t *p = (uint8_t *)realloc(cls, cap);

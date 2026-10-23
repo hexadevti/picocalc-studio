@@ -1,0 +1,18 @@
+@break d01_step.c:17
+@stop d01_step.c:17
+@stop d01_step.c:5
+@stop d01_step.c:6
+@stop d01_step.c:18
+b=9
+@stop d01_step.c:19
+@stop d01_step.c:10
+@stop d01_step.c:12
+@stop d01_step.c:10
+@stop d01_step.c:20
+@break d01_step.c:22
+f=6
+@stop d01_step.c:22
+i=0
+@stop d01_step.c:22
+i=1
+i=2

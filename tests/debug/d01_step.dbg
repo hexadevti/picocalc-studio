@@ -1,0 +1,15 @@
+break d01_step.c:17
+run
+step        # into sq
+next
+next        # back out to main
+next
+step        # into fact(3)
+next
+step        # into fact(2): the same line, a deeper frame
+finish      # out to main: fact(3) has no stop left after the call
+break d01_step.c:22
+continue
+continue
+delete d01_step.c:22
+continue

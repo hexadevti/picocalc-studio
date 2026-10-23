@@ -15,6 +15,8 @@
 //   lines       n_lines x PcxLine (sorted by text offset)
 //   files       n_files x uint32_t: offset of the source file name in strtab
 //   strtab      strtab_size bytes of NUL-terminated names
+//   [debug]     debug builds only, 4-byte aligned: PcxDebug, then n_stops x uint32_t (the text
+//               offset of each stop point, ascending). Other loaders ignore it.
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -61,6 +63,23 @@ typedef struct {
   uint16_t line;
 } PcxLine;
 
+// Debug builds (docs/DEBUGGER.md). Stop point i checks the byte at ram + flags_off + i.
+#define PCX_DEBUG_MAGIC 0x44584350u  // "PCXD"
+typedef struct {
+  uint32_t magic;
+  uint32_t n_stops;
+  uint32_t flags_off;  // offset of __dbg_flags in the ram block (bss)
+} PcxDebug;
+
+// What a stop point's stub hands __pc_dbg_stop(): every register as it was at the stop point.
+// x[2] is its sp, x[5] (t0) the address just after its jal; x[0] is unused. f[] and fcsr are only
+// saved on targets with an F extension. Changes made here are loaded back when the stop returns.
+typedef struct {
+  uint32_t x[32];
+  uint32_t f[32];
+  uint32_t fcsr;
+} PcxDbgRegs;
+
 // Parsed view of a module image held in memory (pointers into the buffer).
 typedef struct {
   const PcxHeader *h;
@@ -70,6 +89,8 @@ typedef struct {
   const PcxLine *lines;
   const uint32_t *files;
   const char *strtab;
+  const PcxDebug *dbg;     // null unless a debug build
+  const uint32_t *stops;   // dbg->n_stops entries
 } PcxView;
 
 // Checks the header and the table bounds. Returns 0, or -1 with a message in err.
@@ -84,6 +105,38 @@ int pcx_relocate(const PcxView *v, uint8_t *text_buf, uint32_t text_addr, uint8_
 
 // Maps a text offset to its source location; returns 0 if not found.
 int pcx_lookup_line(const PcxView *v, uint32_t text_off, const char **file, int *line);
+
+// The stop point a stop came from, given the text offset its stub returns to (x[5] minus the
+// text address); -1 if none.
+int pcx_stop_index(const PcxView *v, uint32_t ret_off);
+
+// ---- stepping (pcx_dbg.c) ----
+// Which stop points stop the program. Breakpoints are kept per stop; the flags the stop points
+// check are the breakpoints while running and all set while stepping, and pcx_dbg_check() decides.
+enum { PCX_DBG_RUN, PCX_DBG_STEP_INTO, PCX_DBG_STEP_OVER, PCX_DBG_STEP_OUT, PCX_DBG_PAUSE };
+
+typedef struct {
+  const PcxView *v;
+  uint32_t n;              // stop points
+  uint8_t *flags;          // __dbg_flags in the module's ram
+  uint8_t *bp;             // n bytes: 1 = breakpoint
+  volatile int mode;       // PCX_DBG_*
+  uint32_t s0;             // where the step started: its frame, file and line
+  const char *file;
+  int line;
+} PcxDbg;
+
+// bp: n_stops bytes the caller owns. Clears the breakpoints and the flags; mode RUN.
+void pcx_dbg_init(PcxDbg *d, const PcxView *v, uint8_t *ram, uint8_t *bp);
+// Sets (on) or clears a breakpoint on `line` of `file` (a path, or its last components). A line
+// without a stop point gets the next line that has one. Returns that line, or 0 if none.
+int pcx_dbg_break(PcxDbg *d, const char *file, int line, int on);
+// At stop point id with frame pointer s0 (x[8]): nonzero if the program stops here.
+int pcx_dbg_check(PcxDbg *d, int id, uint32_t s0);
+// Leaves stop point id (frame s0) in mode PCX_DBG_*.
+void pcx_dbg_resume(PcxDbg *d, int mode, int id, uint32_t s0);
+// Stops at the next stop point, whatever it is (Break in a debug run).
+void pcx_dbg_pause(PcxDbg *d);
 
 #ifdef __cplusplus
 }

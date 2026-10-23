@@ -27,7 +27,7 @@ static int take(size_t *off, size_t len, uint32_t n, size_t size, size_t *start)
 int pcx_parse(const void *buf, size_t len, PcxView *v, char *err, int errlen) {
   const uint8_t *b = (const uint8_t *)buf;
   const PcxHeader *h = (const PcxHeader *)buf;
-  size_t off = sizeof(PcxHeader), text, data, imports, relocs, lines, files, strtab;
+  size_t off = sizeof(PcxHeader), text, data, imports, relocs, lines, files, strtab, stops;
   uint32_t i;
   memset(v, 0, sizeof *v);
   if (!buf || ((uintptr_t)buf & 3u)) return fail(err, errlen, "image buffer not 4-byte aligned", NULL);
@@ -56,6 +56,21 @@ int pcx_parse(const void *buf, size_t len, PcxView *v, char *err, int errlen) {
   v->lines = (const PcxLine *)(const void *)(b + lines);
   v->files = (const uint32_t *)(const void *)(b + files);
   v->strtab = (const char *)(b + strtab);
+
+  off = (off + 3u) & ~(size_t)3u;
+  if (off <= len && len - off >= sizeof(PcxDebug) && ((const PcxDebug *)(const void *)(b + off))->magic == PCX_DEBUG_MAGIC) {
+    const PcxDebug *d = (const PcxDebug *)(const void *)(b + off);
+    off += sizeof(PcxDebug);
+    if (take(&off, len, d->n_stops, 4, &stops)) goto trunc;
+    if (d->flags_off < h->data_size || d->flags_off > h->data_size + h->bss_size ||
+        d->n_stops > h->data_size + h->bss_size - d->flags_off)
+      return fail(err, errlen, "debug flags outside the bss", NULL);
+    v->dbg = d;
+    v->stops = (const uint32_t *)(const void *)(b + stops);
+    for (i = 0; i < d->n_stops; i++)
+      if (v->stops[i] >= h->text_size || (i && v->stops[i] <= v->stops[i - 1]))
+        return fail(err, errlen, "bad stop table", NULL);
+  }
 
   if ((h->entry_main != PCX_NO_ENTRY && h->entry_main >= h->text_size) ||
       (h->entry_setup != PCX_NO_ENTRY && h->entry_setup >= h->text_size) ||
@@ -167,4 +182,14 @@ int pcx_lookup_line(const PcxView *v, uint32_t text_off, const char **file, int 
   if (file) *file = v->strtab + v->files[l->file];
   if (line) *line = l->line;
   return 1;
+}
+
+int pcx_stop_index(const PcxView *v, uint32_t ret_off) {
+  uint32_t lo = 0, hi = v->dbg ? v->dbg->n_stops : 0;
+  while (lo < hi) {  // first stop at or past ret_off
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (v->stops[mid] < ret_off) lo = mid + 1;
+    else hi = mid;
+  }
+  return (int)lo - 1;
 }

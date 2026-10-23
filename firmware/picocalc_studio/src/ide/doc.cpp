@@ -235,6 +235,43 @@ void doc_unpark_all() {
   }
 }
 
+// ---- breakpoints ----
+// They follow their lines: inserting nl lines at (y, x) moves those below y down, and y's own when
+// x is 0 (the line itself moves); deleting lines y0+1..y1 moves theirs onto y0.
+
+static void breaksInsert(Doc *d, int y, int x, int nl) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] > y || (d->bp[i] == y && x == 0)) d->bp[i] += nl;
+}
+
+static void breaksDelete(Doc *d, int y0, int y1) {
+  int k = 0;
+  for (int i = 0; i < d->nbp; i++) {
+    const int b = d->bp[i] > y1 ? d->bp[i] - (y1 - y0) : d->bp[i] > y0 ? y0 : d->bp[i];
+    bool dup = false;
+    for (int j = 0; j < k; j++) dup |= d->bp[j] == b;
+    if (!dup) d->bp[k++] = b;
+  }
+  d->nbp = k;
+}
+
+bool doc_has_break(const Doc *d, int y) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] == y) return true;
+  return false;
+}
+
+bool doc_toggle_break(Doc *d, int y) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] == y) {
+      d->bp[i] = d->bp[--d->nbp];
+      return true;
+    }
+  if (d->nbp == DOC_MAX_BREAKS) return false;
+  d->bp[d->nbp++] = y;
+  return true;
+}
+
 // ---- raw edits (not recorded) ----
 
 static bool rawInsert(Doc *d, int y, int x, const char *s, int n, int *ey, int *ex) {
@@ -254,6 +291,7 @@ static bool rawInsert(Doc *d, int y, int x, const char *s, int n, int *ey, int *
     memmove(&d->ln[y + 1 + nl], &d->ln[y + 1], (d->n - y - 1) * sizeof *d->ln);
     memset(&d->ln[y + 1], 0, nl * sizeof *d->ln);
     d->n += nl;
+    breaksInsert(d, y, x, nl);
   }
   int cy = y, cx = x;
   for (int i = 0; i < n;) {
@@ -301,6 +339,7 @@ static void rawDelete(Doc *d, int y0, int x0, int y1, int x1) {
   for (int i = y0 + 1; i <= y1; i++) free(d->ln[i].s);
   memmove(&d->ln[y0 + 1], &d->ln[y1 + 1], (d->n - y1 - 1) * sizeof *d->ln);
   d->n -= y1 - y0;
+  breaksDelete(d, y0, y1);
 }
 
 char *doc_get_text(const Doc *d, int y0, int x0, int y1, int x1, int *n) {
