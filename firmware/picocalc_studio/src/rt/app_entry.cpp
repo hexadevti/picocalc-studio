@@ -7,10 +7,18 @@
 #include "app_entry.h"
 
 extern "C" {
+#ifdef ARDUINO_ARCH_RP2040
+// arduino-pico's core defines C main() and declares the sketch's setup()/loop() extern "C": those
+// names are the firmware's own here, and would start it again. A built-in project uses these.
+__attribute__((weak)) void setup(void) __asm__("app_setup");
+__attribute__((weak)) void loop(void) __asm__("app_loop");
+__attribute__((weak)) int app_main_c(void) __asm__("app_main");
+#else
 __attribute__((weak)) void setup(void);
 __attribute__((weak)) void loop(void);
 // C++ may not name ::main; bind to the C symbol under another name.
 __attribute__((weak)) int app_main_c(void) __asm__("main");
+#endif
 }
 
 bool rt_has_native_app() { return setup || loop || app_main_c; }

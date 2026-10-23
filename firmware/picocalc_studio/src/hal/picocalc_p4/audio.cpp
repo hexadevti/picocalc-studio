@@ -5,6 +5,7 @@
 // The PDM side always runs at AUDIO_OUT_RATE; the caller's rate is brought to it by linear
 // interpolation in 16.16 fixed point (zero or more output frames per input sample). Writes block
 // on the DMA queue.
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include "../../../board.h"
 #include <Arduino.h>
 #include "driver/i2s_pdm.h"
@@ -112,3 +113,5 @@ uint32_t hal_audio_queued_us() {
   const int32_t q = (int32_t)(s_written - s_played);
   return q > 0 ? (uint32_t)((uint64_t)q * 1000000 / AUDIO_OUT_RATE) : 0;
 }
+
+#endif  // ESP_PLATFORM

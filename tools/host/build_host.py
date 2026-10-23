@@ -51,7 +51,7 @@ def build_rvsim(force=False, verbose=False):
 
 RT_DIR = os.path.join(ROOT, "firmware", "picocalc_studio", "src", "rt")
 GEN_EXPORTS = os.path.join(ROOT, "tools", "gen_exports.py")
-PCXRUN_ELF = os.path.join(ROOT, "build", "host", "pcxrun.elf")
+PCXRUN_ELF = os.path.join(ROOT, "build", "host", "pcxrun-soft.elf" if simfw.SOFT else "pcxrun.elf")
 PCXRUN_DEPS = [os.path.join(HERE, "simfw", "pcxrun.c"), os.path.join(RT_DIR, "pcx_load.c"),
                os.path.join(RT_DIR, "pcx.h"), os.path.join(RT_DIR, "exports.txt"), GEN_EXPORTS]
 
@@ -65,7 +65,7 @@ def build_pcxrun(force=False, verbose=False):
         return PCXRUN_ELF
     if verbose:
         print("  ld  pcxrun.elf")
-    objdir = os.path.join(ROOT, "build", "host", "pcxrun")
+    objdir = os.path.join(ROOT, "build", "host", "pcxrun-soft" if simfw.SOFT else "pcxrun")
     os.makedirs(objdir, exist_ok=True)
     table = os.path.join(objdir, "pcxrun_exports.S")
     r = subprocess.run([sys.executable, GEN_EXPORTS, "--sim-out", table], capture_output=True, text=True)

@@ -1,9 +1,11 @@
 // pcc_main.c - host driver for the PicoCalc C compiler (firmware/picocalc_studio/src/cc).
 //
-//   pcc [-I dir]... [-D name[=value]]... [--exports file] [--mem] file.c... -o out.pcx
+//   pcc [-I dir]... [-D name[=value]]... [--exports file] [--mem] [--lend KB] [--stack KB] file.c... -o out.pcx
 //
 // --mem prints the compiler arena's peak (chunk bytes) to stderr. Only a 32-bit build matches the
-// device's struct sizes: see tools/host/mem.py.
+// device's struct sizes: see tools/host/mem.py. --lend lends the compiler a buffer of KB, as the
+// no-PSRAM device lends it the framebuffer (cc_arena_lend()). --stack limits its stack depth
+// (cc_stack_limit), as the device does.
 //
 // Defaults: -I <repo>/sdcard/pico-dev/include, --exports <repo>/firmware/.../src/rt/exports_table.S
 // (both found relative to this executable in <repo>/build/host). Built by build_host.py.
@@ -92,6 +94,14 @@ int main(int argc, char **argv) {
       exp = argv[++i];
     else if (!strcmp(a, "--mem"))
       mem = 1;
+    else if (!strcmp(a, "--stack") && i + 1 < argc)
+      cc_stack_limit = (size_t)atoi(argv[++i]) * 1024;
+    else if (!strcmp(a, "--lend") && i + 1 < argc) {
+      size_t n = (size_t)atoi(argv[++i]) * 1024;
+      cc_arena_lend(malloc(n), n);
+    }
+    else if (!strcmp(a, "-msoft-float"))
+      cc_soft_float = 1;
     else if (!strncmp(a, "-I", 2))
       incs[ninc++] = a[2] ? a + 2 : argv[++i];
     else if (!strncmp(a, "-D", 2))
@@ -103,7 +113,7 @@ int main(int argc, char **argv) {
       srcs[nsrc++] = a;
   }
   if (!nsrc || !out) {
-    fprintf(stderr, "usage: pcc [-I dir] [-D name[=val]] [--exports file] file.c... -o out.pcx\n");
+    fprintf(stderr, "usage: pcc [-msoft-float] [-I dir] [-D name[=val]] [--exports file] file.c... -o out.pcx\n");
     return 2;
   }
   incs[ninc++] = repo_path(argv[0], "sdcard/pico-dev/include");
@@ -134,7 +144,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   fclose(fp);
-  free(image);
+  if (!cc_arena_is_lent(image))
+    free(image);
   cc_arena_free();
   return 0;
 }

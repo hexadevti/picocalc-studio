@@ -4,6 +4,7 @@
 // exiting. Internal header; users of the compiler include cc.h.
 #include <assert.h>
 #include <ctype.h>
+#include <limits.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -47,15 +48,20 @@ void cc_tok_sweep(void);     // ...free the unmarked ones and stop
 void cc_fn_begin(void);  // allocate a function's Nodes and locals in their own arena...
 void cc_fn_end(void);    // ...and drop them
 bool cc_fn_is_open(void);
-typedef struct { void *chunk, *next; size_t used, total; } CcFnMark;
+typedef struct { void *chunk, *next; size_t used, total; } CcArenaMark;
+typedef struct { CcArenaMark fn, node; } CcFnMark;
 CcFnMark cc_fn_mark(void);
-void cc_fn_release(CcFnMark m);  // drop what the function arena got since the mark
+void cc_fn_release(CcFnMark m);   // drop what the function arena and its Nodes got since the mark
+void cc_node_release(CcFnMark m);  // ...only the Nodes
 void *cc_fn_calloc(size_t size);
+void *cc_node_calloc(size_t size);  // a Node: in a separate part of the function arena
 bool cc_fn_types(bool on);       // Types in the function arena too (while one is open); returns the old setting
 void *cc_type_calloc(size_t size);
 bool cc_in_fn_arena(void *p);
 void *cc_grow(void *p, size_t old_size, size_t new_size);
 void cc_grow_free(void *p);  // frees what cc_grow() allocated
+void *cc_grow_keep(void *p, size_t n);
+void *cc_image_alloc(size_t n);  // the linked image: lent memory first, else malloc()  // trims a grown array to n and gives it to the object
 bool cc_keep(bool on);  // on: allocate in the main arena even inside a scratch section; returns the old setting
 
 #define calloc(n, size) cc_calloc((n), (size))
@@ -141,8 +147,10 @@ struct Token {
 };
 
 noreturn void error(char *fmt, ...) __attribute__((format(printf, 1, 2)));
+noreturn void cc_out_of_memory(const char *what, size_t n);
 noreturn void error_at(char *loc, char *fmt, ...) __attribute__((format(printf, 2, 3)));
 noreturn void error_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
+void check_stack(Token *tok);
 void warn_tok(Token *tok, char *fmt, ...) __attribute__((format(printf, 2, 3)));
 bool equal(Token *tok, char *op);
 Token *skip(Token *tok, char *op);
@@ -178,6 +186,7 @@ void undef_macro(char *name);
 Token *preprocess(Token *tok);
 Token *preprocess_more(Token *tok);
 void preprocess_release(Token *tok, Token *end, bool keep);
+void preprocess_release_init(Token *tok, Token *end);
 void pin_token(Token *tok);
 void preprocess_reset(void);
 
@@ -192,29 +201,39 @@ struct Obj {
   char *name;    // Variable name
   Type *ty;      // Type
   Token *tok;    // representative token
-  bool is_local; // local or global/function
   int align;     // alignment
+  bool is_local : 1; // local or global/function
+
+  // Local variable
+  bool is_byref : 1;   // struct parameter passed by reference: the slot holds its address
+  bool addr_taken : 1;
+
+  // Global variable or function
+  bool is_function : 1;
+  bool is_definition : 1;
+  bool is_static : 1;
+
+  // Global variable
+  bool is_tentative : 1;
+  bool is_tls : 1;
+
+  // Function
+  bool is_inline : 1;
+
+  // Static inline function
+  bool is_live : 1;
+  bool is_root : 1;
 
   // Local variable
   int offset;
-  bool is_byref;  // struct parameter passed by reference: the slot holds its address
   int reg;        // code generator: register holding the variable (0 = in memory)
   int uses;       // code generator: uses, weighted by loop nesting
-  bool addr_taken;
-
-  // Global variable or function
-  bool is_function;
-  bool is_definition;
-  bool is_static;
 
   // Global variable
-  bool is_tentative;
-  bool is_tls;
   char *init_data;
   Relocation *rel;
 
   // Function
-  bool is_inline;
   Obj *params;
   Node *body;
   Obj *locals;
@@ -223,8 +242,6 @@ struct Obj {
   int stack_size;
 
   // Static inline function
-  bool is_live;
-  bool is_root;
   StringArray refs;
 };
 
@@ -235,7 +252,7 @@ typedef struct Relocation Relocation;
 struct Relocation {
   Relocation *next;
   int offset;
-  char **label;
+  char *label;
   int addend;
 };
 
@@ -289,6 +306,7 @@ typedef enum {
   ND_ASM,       // "asm"
   ND_CAS,       // Atomic compare-and-swap
   ND_EXCH,      // Atomic exchange
+  ND_PACKED,    // A statement stored compactly (pack_stmt()), expanded by cc_unpack()
 } NodeKind;
 
 // AST node type
@@ -358,6 +376,9 @@ struct Node {
     // ND_VAR, ND_VLA_PTR, ND_MEMZERO
     Obj *var;
 
+    // ND_PACKED: the encoded statement (an ND_PACKED node is allocated only up to here)
+    unsigned char *packed;
+
     // ND_NUM
     struct {
       int64_t val;
@@ -373,6 +394,7 @@ static inline bool is_ctl_node(Node *node) {
 }
 
 Node *new_cast(Node *expr, Type *ty);
+Node *cc_unpack(Node *node);  // an ND_PACKED's statement, in Nodes until cc_node_release()
 Node *implicit_cast(Node *expr, Type *ty);
 int64_t const_expr(Token **rest, Token *tok);
 Obj *parse(Token *tok);
@@ -444,10 +466,9 @@ struct Type {
     // Function type
     struct {
       Type *return_ty;
-      Type *params;
+      Type **params;  // NULL-terminated; NULL if there are none
     };
   };
-  Type *next;  // function parameter list
 };
 
 // Struct member
@@ -492,6 +513,7 @@ bool is_compatible(Type *t1, Type *t2);
 Type *copy_type(Type *ty);
 Type *keep_type(Type *ty);
 Type *pointer_to(Type *base);
+void type_reset(void);
 Type *func_type(Type *return_ty);
 Type *array_of(Type *base, int size);
 Type *vla_of(Type *base, Node *expr);
@@ -505,6 +527,7 @@ void add_type(Node *node);
 
 void codegen_begin(CcObject *out);
 void codegen_function(Obj *fn);
+void codegen_string(Obj *var, char *data);
 void codegen_end(Obj *prog);
 int align_to(int n, int align);
 
@@ -549,6 +572,7 @@ void hashmap_test(void);
 
 bool file_exists(char *path);
 char *cc_dirname(char *path);
+char *cc_normpath(char *path);
 
 extern StringArray include_paths;
 extern bool opt_fcommon;

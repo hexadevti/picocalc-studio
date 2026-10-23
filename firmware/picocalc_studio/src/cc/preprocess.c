@@ -69,10 +69,16 @@ struct CondIncl {
 };
 
 typedef struct Hideset Hideset;
+// Hidesets are interned (hideset_add()): every set exists once, as a chain whose nodes are shared
+// by the sets that extend it, so the tokens of an expansion share one instead of each copying it.
 struct Hideset {
-  Hideset *next;
+  Hideset *next;     // the rest of the set
   char *name;
+  Hideset *kids;     // the interned sets that are this one plus a name
+  Hideset *sibling;  // the next of those of this one's parent
 };
+
+static Hideset *hideset_roots;  // the interned one-name sets
 
 static HashMap macros;
 static CondIncl *cond_incl;
@@ -88,20 +94,27 @@ static Token *raw_root;              // origin root of the last kept token
 static Token *pp_rest;               // where the top-level pass resumes for the next declaration
 static Token *batch_roots;           // origin roots copied for the current declaration
 static int nest;                     // ( [ { nesting of the top-level output
+static int brackets;                 // ( [ nesting of it
+static int batch_len;                // tokens handed over in this batch so far
 static bool assigned, fn_body;       // "=" seen in this declaration; the open "{" is a function body
+static int braces;                   // { nesting of it
+static uint64_t block_braces;        // bit i: the brace at depth i+1 opens a function body or block
 static Token *guard_hash;            // a just-included file's "#ifndef X" / "#define X" opening
 static char *guard_macro, *guard_path;
 
 void preprocess_reset(void) {
   macros = pragma_once = include_path_cache = include_guards = (HashMap){0};
   guard_hash = pp_rest = batch_roots = NULL;
-  nest = 0;
+  nest = brackets = batch_len = 0;
   assigned = fn_body = false;
+  braces = 0;
+  block_braces = 0;
   cond_incl = NULL;
   include_next_idx = 0;
   counter = 0;
   depth = 0;
   root_src = root_copy = raw_root = NULL;
+  hideset_roots = NULL;
 }
 
 static Token *preprocess2(Token *tok);
@@ -144,14 +157,7 @@ static Token *keep_token(Token *t) {
   raw_root = t->origin;
   bool keep = cc_keep(true);
   Token *c = copy_token(t);
-  c->hideset = NULL;
-  if (t->kind == TK_STR) {
-    Type *ty = calloc(1, sizeof(Type));
-    *ty = *t->ty;
-    c->ty = ty;
-    c->str = calloc(1, ty->size);
-    memcpy(c->str, t->str, ty->size);
-  }
+  c->hideset = NULL;  // a string's Type and data stay in scratch, which lasts the whole compile
   if (t->origin) {
     Token *r = t->origin;  // a root (expand_macro())
     if (r != root_src) {
@@ -176,22 +182,6 @@ static Token *new_eof(Token *tok) {
   return t;
 }
 
-static Hideset *new_hideset(char *name) {
-  Hideset *hs = calloc(1, sizeof(Hideset));
-  hs->name = name;
-  return hs;
-}
-
-static Hideset *hideset_union(Hideset *hs1, Hideset *hs2) {
-  Hideset head = {};
-  Hideset *cur = &head;
-
-  for (; hs1; hs1 = hs1->next)
-    cur = cur->next = new_hideset(hs1->name);
-  cur->next = hs2;
-  return head.next;
-}
-
 static bool hideset_contains(Hideset *hs, char *s, int len) {
   for (; hs; hs = hs->next)
     if (strlen(hs->name) == len && !strncmp(hs->name, s, len))
@@ -199,14 +189,34 @@ static bool hideset_contains(Hideset *hs, char *s, int len) {
   return false;
 }
 
-static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2) {
-  Hideset head = {};
-  Hideset *cur = &head;
+// The interned set base + {name}.
+static Hideset *hideset_add(Hideset *base, char *name) {
+  if (hideset_contains(base, name, strlen(name)))
+    return base;
+  Hideset **list = base ? &base->kids : &hideset_roots;
+  for (Hideset *hs = *list; hs; hs = hs->sibling)
+    if (!strcmp(hs->name, name))
+      return hs;
+  Hideset *hs = calloc(1, sizeof(Hideset));
+  hs->next = base;
+  hs->name = name;
+  hs->sibling = *list;
+  *list = hs;
+  return hs;
+}
 
+static Hideset *hideset_union(Hideset *hs1, Hideset *hs2) {
+  for (; hs1; hs1 = hs1->next)
+    hs2 = hideset_add(hs2, hs1->name);
+  return hs2;
+}
+
+static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2) {
+  Hideset *hs = NULL;
   for (; hs1; hs1 = hs1->next)
     if (hideset_contains(hs2, hs1->name, strlen(hs1->name)))
-      cur = cur->next = new_hideset(hs1->name);
-  return head.next;
+      hs = hideset_add(hs, hs1->name);
+  return hs;
 }
 
 // Append tok2 to the end of tok1, dropping tok1's EOF. tok1 is relinked in place (upstream
@@ -760,7 +770,7 @@ static bool expand_macro(Token **rest, Token *tok) {
   Token *root = tok->origin ? tok->origin : tok;
 
   if (m->is_objlike) {
-    Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
+    Hideset *hs = hideset_add(tok->hideset, m->name);
     Token *body = macro_body(m), *eof = body;
     for (; eof->kind != TK_EOF; eof = eof->next) {
       eof->hideset = hs;
@@ -794,7 +804,7 @@ static bool expand_macro(Token **rest, Token *tok) {
   // macro token and the closing parenthesis and use it as a new hideset
   // as explained in the Dave Prossor's algorithm.
   Hideset *hs = hideset_intersection(macro_token->hideset, rparen->hideset);
-  hs = hideset_union(hs, new_hideset(m->name));
+  hs = hideset_add(hs, m->name);
 
   // subst() returns fresh tokens ending in the EOF of def, so tag them in place; def is
   // garbage after the splice.
@@ -944,6 +954,17 @@ static void read_line_marker(Token **rest, Token *tok) {
   cc_keep(keep);
 }
 
+// Inside a function body, does a "{" after prev open a block (as opposed to an initializer, a
+// struct body, a statement expression)? Only directly inside another block, after a token that
+// can end a statement or start one (none: a batch was just cut after a ";"); a wrong "no" only
+// makes a batch longer (splits_body()).
+static bool opens_block(Token *prev) {
+  if (brackets != 0 || braces == 0 || braces > 64 || !(block_braces >> (braces - 1) & 1))
+    return false;
+  return !prev || equal(prev, ")") || equal(prev, ";") || equal(prev, "{") || equal(prev, "}") ||
+         equal(prev, ":") || equal(prev, "else") || equal(prev, "do");
+}
+
 // Does output token t (after prev) end a top-level declaration? That is a ";" outside any
 // brackets, or the "}" closing a function body: a "{" right after ")" with no "=" before it in the
 // declaration (which would make it a compound literal). A missed end only makes a batch longer.
@@ -953,19 +974,29 @@ static bool ends_decl(Token *t, Token *prev) {
   switch (*t->loc) {
   case '(': case '[':
     nest++;
+    brackets++;
     return false;
   case ')': case ']':
     nest--;
+    brackets--;
     return false;
-  case '{':
+  case '{': {
+    bool block;
     if (nest++ == 0)
-      fn_body = !assigned && prev && equal(prev, ")");
+      block = fn_body = !assigned && prev && equal(prev, ")");
+    else
+      block = opens_block(prev);
+    if (braces < 64)
+      block_braces = block ? block_braces | 1ull << braces : block_braces & ~(1ull << braces);
+    braces++;
     return false;
+  }
   case '=':
     if (nest == 0)
       assigned = true;
     return false;
   case '}':
+    braces--;
     if (--nest != 0 || !fn_body)
       return false;
     fn_body = false;
@@ -981,6 +1012,26 @@ static bool ends_decl(Token *t, Token *prev) {
   return true;
 }
 
+// A long initializer ("= {" at the top level) is handed over in batches too, each cut after a ","
+// directly inside its braces; the parser fetches the next one there (is_end(), consume_end()).
+#define INIT_BATCH 256
+
+static bool splits_init(Token *t) {
+  return assigned && nest > 0 && brackets == 0 && batch_len >= INIT_BATCH && equal(t, ",");
+}
+
+// A long function body is handed over in batches too, each cut after a ";" ending a statement
+// directly inside a block; the parser fetches the next one where a statement may follow
+// (stmt_batch()), so a function takes little more than its Nodes.
+#ifndef BODY_BATCH
+#define BODY_BATCH 256
+#endif
+
+static bool splits_body(Token *t) {
+  return fn_body && brackets == 0 && braces > 0 && braces <= 64 &&
+         (block_braces >> (braces - 1) & 1) && batch_len >= BODY_BATCH && equal(t, ";");
+}
+
 // Visit all tokens in `tok` while evaluating preprocessing
 // macros and directives.
 // At the top level, each output token is copied into the main arena as it is produced and its
@@ -988,6 +1039,7 @@ static bool ends_decl(Token *t, Token *prev) {
 // with a TK_MORE token for preprocess_more(). Nested calls (#if, macro arguments, #include and
 // #line operands) produce scratch lists their callers still work on.
 static Token *preprocess2(Token *tok) {
+  check_stack(tok);
   Token head = {};
   Token *cur = &head;
   bool top = ++depth == 1;
@@ -1010,7 +1062,9 @@ static Token *preprocess2(Token *tok) {
       cur = cur->next = keep_token(tok);
       cc_tok_free(tok);
       tok = next;
-      if (ends_decl(cur, prev)) {
+      batch_len++;
+      if (ends_decl(cur, prev) || splits_init(cur) || splits_body(cur)) {
+        batch_len = 0;
         pp_rest = tok;
         root_src = NULL;  // the next declaration's tokens get roots of their own
         bool keep = cc_keep(true);
@@ -1033,7 +1087,7 @@ static Token *preprocess2(Token *tok) {
       char *filename = read_include_filename(&tok, tok->next, &is_dquote);
 
       if (filename[0] != '/' && is_dquote) {
-        char *path = format("%s/%s", cc_dirname(start->file->name), filename);
+        char *path = cc_normpath(format("%s/%s", cc_dirname(start->file->name), filename));
         if (file_exists(path)) {
           tok = include_file(tok, path, start->next->next);
           continue;
@@ -1406,10 +1460,14 @@ Token *preprocess(Token *tok) {
   return finish(preprocess2(tok), depth == 0);
 }
 
-// Replaces t, the TK_MORE token ending the parser's last declaration, with the next one.
+// Replaces t, the TK_MORE token ending the parser's last declaration, with the next one. Called
+// inside a global's initializer (next_batch()), so the Types of the string literals it lexes must
+// not go in the function arena, which outlives only the element being parsed.
 Token *preprocess_more(Token *t) {
   bool keep = cc_keep(false);
+  bool fn_types = cc_fn_types(false);
   Token *first = finish(preprocess2(pp_rest), true);
+  cc_fn_types(fn_types);
   cc_keep(keep);
   *t = *first;
   cc_tok_free(first);
@@ -1430,6 +1488,24 @@ void preprocess_release(Token *tok, Token *end, bool keep) {
       cc_tok_free(r);
   }
   batch_roots = NULL;
+}
+
+// Recycles the tokens [tok, end) of a long initializer already parsed when the next batch is
+// fetched at end, the "," ending this one, and the origin roots except end's.
+void preprocess_release_init(Token *tok, Token *end) {
+  for (Token *next; tok != end; tok = next) {
+    next = tok->next;
+    if (!tok->pinned)
+      cc_tok_free(tok);
+  }
+  for (Token *r = batch_roots, *next; r; r = next) {
+    next = r->next;
+    if (!r->pinned && r != end->origin)
+      cc_tok_free(r);
+  }
+  batch_roots = end->origin;
+  if (batch_roots)
+    batch_roots->next = NULL;
 }
 
 // Keeps a token (and its origin root) alive after its declaration, for a type that refers to it.

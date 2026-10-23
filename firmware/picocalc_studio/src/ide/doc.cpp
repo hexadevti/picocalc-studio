@@ -65,15 +65,24 @@ static bool load(Doc *d, const char *text, size_t len) {
   return true;
 }
 
+static Doc *s_open;            // open docs, for doc_park_all()
+
+static void addOpen(Doc *d) {
+  d->nextOpen = s_open;
+  s_open = d;
+}
+
 Doc *doc_new(const char *path, const char *text) {
   Doc *d = (Doc *)calloc(1, sizeof *d);
   if (!d) return nullptr;
   snprintf(d->path, sizeof d->path, "%s", path);
   if (!load(d, text ? text : "", text ? strlen(text) : 0)) { doc_free(d); return nullptr; }
+  addOpen(d);
   return d;
 }
 
-Doc *doc_open(const char *path) {
+// The whole file, malloc'ed and NUL-terminated (*len gets its length). Null if it can't be read.
+static char *readFile(const char *path, size_t *len) {
   FILE *f = fopen(path, "rb");
   if (!f) return nullptr;
   fseek(f, 0, SEEK_END);
@@ -85,10 +94,19 @@ Doc *doc_open(const char *path) {
   size_t got = fread(buf, 1, size, f);
   fclose(f);
   buf[got] = 0;
+  *len = got;
+  return buf;
+}
+
+Doc *doc_open(const char *path) {
+  size_t len;
+  char *buf = readFile(path, &len);
+  if (!buf) return nullptr;
   Doc *d = (Doc *)calloc(1, sizeof *d);
   if (d) {
     snprintf(d->path, sizeof d->path, "%s", path);
-    if (!load(d, buf, got)) { doc_free(d); d = nullptr; }
+    if (load(d, buf, len)) addOpen(d);
+    else { doc_free(d); d = nullptr; }
   }
   free(buf);
   return d;
@@ -117,14 +135,71 @@ static void dropUndo(Doc *d, int from, int to) {
   for (int i = from; i < to; i++) free(d->u[i].s);
 }
 
-void doc_free(Doc *d) {
-  if (!d) return;
+static void freeLines(Doc *d) {
   for (int i = 0; i < d->n; i++) free(d->ln[i].s);
-  dropUndo(d, 0, d->nt);
-  free(d->u);
   free(d->ln);
   free(d->hl);
+  d->ln = nullptr;
+  d->hl = nullptr;
+  d->n = d->cap = d->hlValid = 0;
+}
+
+void doc_free(Doc *d) {
+  if (!d) return;
+  for (Doc **p = &s_open; *p; p = &(*p)->nextOpen)
+    if (*p == d) { *p = d->nextOpen; break; }
+  freeLines(d);
+  dropUndo(d, 0, d->nt);
+  free(d->u);
   free(d);
+}
+
+// Whether reading the file again gives the doc back: it was opened or saved and not edited since.
+// (A new doc is marked modified until it is saved.)
+static bool matchesFile(const Doc *d) {
+  if (d->modified) return false;
+  FILE *f = fopen(d->path, "rb");
+  if (!f) return false;
+  fclose(f);
+  return true;
+}
+
+void doc_park_all() {
+  for (Doc *d = s_open; d; d = d->nextOpen) {
+    if (d->parked || !matchesFile(d)) continue;
+    freeLines(d);
+    d->parked = true;
+  }
+}
+
+void doc_unpark_all() {
+  for (Doc *d = s_open; d; d = d->nextOpen) {
+    if (!d->parked) continue;
+    d->parked = false;
+    size_t len;
+    char *buf = readFile(d->path, &len);
+    const bool ok = buf && load(d, buf, len);
+    free(buf);
+    if (!ok) {
+      // Keep the doc (the editor holds it) but never let it be saved over the file.
+      freeLines(d);
+      dropUndo(d, 0, d->nt);
+      d->nu = d->nt = 0;
+      d->readOnly = true;
+      d->modified = false;
+      d->cx = d->cy = d->want = d->top = d->left = 0;
+      d->sel = d->marking = false;
+      static const char note[] = "// Out of memory reading this file back after the build.\n// Close it and open it again.";
+      if (!load(d, note, sizeof note - 1)) {
+        freeLines(d);
+        load(d, "", 0);           // one empty line, if even that fits
+      }
+      continue;
+    }
+    if (d->cy >= d->n) d->cy = d->n - 1;
+    if (d->ay >= d->n) d->sel = false;
+    if (d->top >= d->n) d->top = d->n - 1;
+  }
 }
 
 // ---- raw edits (not recorded) ----

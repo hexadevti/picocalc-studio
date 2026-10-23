@@ -1,4 +1,5 @@
 // export.cpp - see export.h. The image math is in image.c (shared with the host tool pcexport).
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
@@ -156,3 +157,5 @@ void ex_run_app() {
     endScreen(msg);
   }
 }
+
+#endif  // ESP_PLATFORM

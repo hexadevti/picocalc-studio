@@ -25,6 +25,7 @@ struct Doc {
   DocLine *ln;
   int n, cap;              // n >= 1 always
   bool modified;
+  bool readOnly;           // a library header outside the project: the editor only views it
   // view
   int cx, cy;              // cursor column and line
   int want;                // column the cursor tries to keep on Up/Down
@@ -38,12 +39,20 @@ struct Doc {
   // undo: u[0, nu) can be undone, u[nu, nt) redone
   DocUndo *u;
   int nu, nt, ucap, group;
+  bool parked;             // doc_park_all() freed the lines
+  Doc *nextOpen;           // doc.cpp's list of open docs
 };
 
 Doc *doc_open(const char *path);      // null if it can't be read (or out of memory)
 Doc *doc_new(const char *path, const char *text);
 bool doc_save(Doc *d);
 void doc_free(Doc *d);
+
+// Frees the lines of every open doc that matches its file (to make room for a build), and reads
+// them back. Nothing may look at a doc in between. A doc that can't be read back becomes a
+// read-only note saying so.
+void doc_park_all();
+void doc_unpark_all();
 
 // Edits are recorded for undo, grouped: call doc_begin() once per user action (with the cursor
 // still where it was). Typing (doc_begin_typing) runs into the previous typing group up to a word.

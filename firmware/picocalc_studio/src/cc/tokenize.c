@@ -265,6 +265,22 @@ static Token *bad_literal(char *start, char *msg) {
   return tok;
 }
 
+// The Type of a narrow string literal of len chars; short ones share one per length, so a table
+// of strings does not take a Type each. Nothing modifies these (join_adjacent_string_literals()
+// makes a new one).
+static Type *str_types[32];
+
+static Type *str_type(int len) {
+  if (len >= 32)
+    return array_of(ty_uchar, len);
+  if (!str_types[len]) {
+    bool fn_types = cc_fn_types(false);
+    str_types[len] = array_of(ty_uchar, len);
+    cc_fn_types(fn_types);
+  }
+  return str_types[len];
+}
+
 static Token *read_string_literal(char *start, char *quote) {
   char *end = string_literal_end(quote + 1);
   if (!end)
@@ -280,7 +296,7 @@ static Token *read_string_literal(char *start, char *quote) {
   }
 
   Token *tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty_uchar, len + 1);
+  tok->ty = str_type(len + 1);
   tok->str = buf;
   return tok;
 }
@@ -497,26 +513,53 @@ Token *tokenize_string_literal(Token *tok, Type *basety) {
   return t;
 }
 
-// Lines lexed per chunk of a lazily tokenized file.
+// Lines lexed per chunk of a lazily tokenized file, and at most about this many tokens of one.
 #define LEX_LINES 32
+#define LEX_STEPS 1024
+
+// Is the line starting at p a directive? (Or could it be, after a comment.)
+static bool directive_line(char *p) {
+  while (*p == ' ' || *p == '\t')
+    p++;
+  return *p == '#' || *p == '/';
+}
+
+// Is the line starting at p an #include? A chunk ends after one, so the includer's next lines
+// are not held as tokens while the included file is read.
+static bool include_line(char *p) {
+  while (*p == ' ' || *p == '	')
+    p++;
+  if (*p++ != '#')
+    return false;
+  while (*p == ' ' || *p == '	')
+    p++;
+  return startswith(p, "include");
+}
 
 // Tokenizes file from p, which starts line `line`. Lazily, it stops at the first line break
 // after LEX_LINES lines with a TK_MORE token that tokenize_more() resumes from, so raw tokens are
-// produced only as the preprocessor gets to them and their slots can be recycled. Chunks end only
-// between lines, so a directive line is always whole. At the end of the file the list continues
-// with file->after, or an EOF token. With one_line, it stops at the end of the line with an EOF.
-static Token *lex(File *file, char *p, int line, bool lazy, bool one_line) {
+// produced only as the preprocessor gets to them and their slots can be recycled. A long line is
+// cut between tokens too, but a directive line is always whole. At the end of the file the list
+// continues with file->after, or an EOF token. With one_line, it stops at the end of the line with
+// an EOF. bol and space are what the first token gets (where p is in its line).
+static Token *lex(File *file, char *p, int line, bool lazy, bool one_line, bool bol, bool space) {
   current_file = file;
   line_no = line;
-  int stop = line + LEX_LINES;
+  int stop = line + LEX_LINES, steps = 0;
+  char *line_start = p;
 
   Token head = {};
   Token *cur = &head;
 
-  at_bol = true;
-  has_space = false;
+  at_bol = bol;
+  has_space = space;
 
   while (*p) {
+    if (lazy && ++steps > LEX_STEPS && *p != '\n' && !directive_line(line_start)) {
+      cur->next = new_token(TK_MORE, p, p);  // keeps at_bol and has_space for the resumption
+      return head.next;
+    }
+
     // Skip line comments.
     if (startswith(p, "//")) {
       p += 2;
@@ -547,7 +590,9 @@ static Token *lex(File *file, char *p, int line, bool lazy, bool one_line) {
       line_no++;
       at_bol = true;
       has_space = false;
-      if (lazy && line_no >= stop && *p) {
+      bool after_include = lazy && include_line(line_start);
+      line_start = p;
+      if (lazy && (line_no >= stop || after_include) && *p) {
         cur->next = new_token(TK_MORE, p, p);
         return head.next;
       }
@@ -666,19 +711,19 @@ static Token *lex(File *file, char *p, int line, bool lazy, bool one_line) {
 
 // Tokenizes the rest of the line at p (a macro body) again, ending it with an EOF.
 Token *tokenize_line(File *file, char *p, int line) {
-  return lex(file, p, line, false, true);
+  return lex(file, p, line, false, true, true, false);
 }
 
 // Tokenize a given string and returns new tokens.
 Token *tokenize(File *file) {
-  return lex(file, file->contents, 1, false, false);
+  return lex(file, file->contents, 1, false, false, true, false);
 }
 
 // Replaces a TK_MORE token, in place, with the first token of the next chunk (which may be
 // another TK_MORE, or the includer's token after the file), and recycles that token's slot.
 void tokenize_more(Token *tok) {
   bool track = cc_tok_track(false);  // the input, not part of a macro expansion
-  Token *first = lex(tok->file, tok->loc, tok->line_no, true, false);
+  Token *first = lex(tok->file, tok->loc, tok->line_no, true, false, tok->at_bol, tok->has_space);
   *tok = *first;
   cc_tok_free(first);
   cc_tok_track(track);
@@ -831,6 +876,7 @@ void tokenize_reset(void) {
   input_files = NULL;
   file_no = 0;
   keyword_map = (HashMap){0};
+  memset(str_types, 0, sizeof(str_types));
 }
 
 // Tokenizes a file lazily (see lex()); its tokens are followed by `after`, or EOF if NULL.
@@ -866,5 +912,5 @@ Token *tokenize_file(char *path, Token *after) {
   file_no++;
   cc_keep(keep);
 
-  return lex(file, p, 1, true, false);
+  return lex(file, p, 1, true, false, true, false);
 }

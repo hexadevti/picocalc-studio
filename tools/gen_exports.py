@@ -7,6 +7,7 @@ Inputs:
 Outputs:
   firmware/picocalc_studio/src/rt/exports_table.S   sorted {name, address} table: rt_exports[], rt_exports_count
   sdcard/pico-dev/include/picocalc.h                 copy of the SDK header for the on-device compiler
+  sdcard/pico-dev/lib/picocalc/*.cpp                 copies of the SDK sources, for the IDE's F9 (read-only)
 
 The table is assembly, not C, so it can name libc functions and compiler builtins without
 declaring them (no prototype or builtin clashes). Run it after changing either input:
@@ -28,6 +29,7 @@ HEADER = FW / "src" / "sdk" / "picocalc.h"
 EXTRA = FW / "src" / "rt" / "exports.txt"
 OUT = FW / "src" / "rt" / "exports_table.S"
 SD_HEADER = REPO / "sdcard" / "pico-dev" / "include" / "picocalc.h"
+SD_LIB = REPO / "sdcard" / "pico-dev" / "lib" / "picocalc"
 
 PROTO = re.compile(r"^[A-Za-z_][\w \t\*]*?\b([A-Za-z_]\w*)\s*\([^;{]*\)[^;{]*;")
 
@@ -58,7 +60,10 @@ def extra_symbols(text):
         if not line:
             continue
         name, _, target = line.partition("=")
-        out.append((name.strip(), (target or name).strip()))
+        name = name.strip()
+        weak = name.startswith("?")
+        name = name.lstrip("?").strip()
+        out.append((name, ("?" if weak else "") + (target.strip() or name)))
     return out
 
 
@@ -73,8 +78,15 @@ def table_source(entries, title):
         "    .global rt_exports",
         "rt_exports:",
     ]
+    # `?` symbols are weak only where they may be missing (an ilp32f libgcc); elsewhere they must
+    # be strong, or the linker would not pull them out of libgcc.a.
+    out.append("#ifdef __riscv_flen")
+    for n in names:
+        if entries[n].startswith("?"):
+            out.append(f"    .weak {entries[n][1:]}")
+    out.append("#endif")
     for i, n in enumerate(names):
-        out.append(f"    .word .Ls{i}, {entries[n]}")
+        out.append(f"    .word .Ls{i}, {entries[n].lstrip('?')}")
     out += [
         "",
         "    .global rt_exports_count",
@@ -117,7 +129,12 @@ def main():
 
     SD_HEADER.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(HEADER, SD_HEADER)
-    print(f"gen_exports: {len(names)} symbols -> {OUT.relative_to(REPO)}, header -> {SD_HEADER.relative_to(REPO)}")
+    SD_LIB.mkdir(parents=True, exist_ok=True)
+    sources = sorted(HEADER.parent.glob("*.cpp"))
+    for src in sources:
+        shutil.copyfile(src, SD_LIB / src.name)
+    print(f"gen_exports: {len(names)} symbols -> {OUT.relative_to(REPO)}, header -> {SD_HEADER.relative_to(REPO)}, "
+          f"{len(sources)} sources -> {SD_LIB.relative_to(REPO)}")
 
 
 if __name__ == "__main__":

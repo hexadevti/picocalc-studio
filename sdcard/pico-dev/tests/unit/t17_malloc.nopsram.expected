@@ -1,0 +1,6 @@
+stress check 35817195
+calloc nonzero 0
+list 1 4 9 16 25 36 49 64 81 100
+realloc abc-grown
+big null
+leaked 16 blocks

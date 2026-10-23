@@ -3,7 +3,9 @@
 // read again for each list or hint. Declarations (functions, macros, typedefs, struct/union/enum
 // tags, enum constants, globals) are found by a scanner that knows just enough C: brace, paren
 // and bracket depth and where a file-scope statement ends. In the open files every other name
-// counts too, as a plain word.
+// counts too, as a plain word. A fourth table, the library sources (what the headers declare,
+// defined), is only for F9.
+#include <limits.h>
 #include <string.h>
 #include <strings.h>
 #include <stdio.h>
@@ -101,9 +103,25 @@ static const char *arenaStr(Arena *a, const char *s, int n) {
 
 struct Sym {
   const char *name, *sig;  // sig: the declaration, or null
+  const char *path;        // where it is declared (0-based line and column); null for keywords
+  int line, col;
   uint8_t kind;
+  bool def;                // a definition (a function's body, a global without extern), not a prototype
   int8_t file;             // project table: index into s_files, else -1
 };
+
+struct Loc {
+  const char *path;
+  int line, col;
+  bool def;
+};
+
+static void place(Sym &y, const Loc &at) {
+  y.path = at.path;
+  y.line = at.line;
+  y.col = at.col;
+  y.def = at.def;
+}
 
 struct Table {
   Sym *v;
@@ -142,8 +160,9 @@ static void tableReset(Table *t) {
   t->str.used = 0;
 }
 
-// Adds a name, or gives a plain word already there the kind and declaration of a real one.
-static void add(Table *t, const char *s, int n, uint8_t kind, const char *sig, int sigLen, int file) {
+// Adds a name, or gives a plain word already there the kind and declaration of a real one. A
+// definition after a declaration of the same name moves its place there.
+static void add(Table *t, const char *s, int n, uint8_t kind, const char *sig, int sigLen, int file, const Loc &at) {
   if (n <= 0 || n > NAME_MAX) return;
   const int i = find(t, s, n);
   if (i >= 0) {
@@ -152,6 +171,10 @@ static void add(Table *t, const char *s, int n, uint8_t kind, const char *sig, i
       y.kind = kind;
       y.file = (int8_t)file;
       y.sig = sig ? arenaStr(&t->str, sig, sigLen) : nullptr;
+      place(y, at);
+    } else if (kind == y.kind && at.def && !y.def) {
+      y.file = (int8_t)file;
+      place(y, at);
     }
     return;
   }
@@ -176,14 +199,24 @@ static void add(Table *t, const char *s, int n, uint8_t kind, const char *sig, i
   y.sig = sig ? arenaStr(&t->str, sig, sigLen) : nullptr;
   y.kind = kind;
   y.file = (int8_t)file;
+  place(y, at);
   hashInsert(t, t->n++);
 }
 
 // ---- the scanner ----
 
+struct Cand {              // a name that may turn out to be declared, and where it is
+  char s[NAME_MAX + 1];
+  int len, y, x;
+  bool hidden;
+};
+
 struct Scanner {
   Table *t;
   int file;
+  const char *path;        // in the table's strings
+  const char *line;        // the line being scanned, line y
+  int y;
   bool words;              // every name counts, not just declarations
   bool header;             // names starting with '_' are the C library's own: leave them out
   bool inComment, contLine;
@@ -194,25 +227,24 @@ struct Scanner {
   // the file-scope statement so far
   char stmt[SIG_MAX + 1];
   int stmtLen;
-  char last[NAME_MAX + 1], func[NAME_MAX + 1], tdef[NAME_MAX + 1];   // name candidates
-  int lastLen, funcLen, tdefLen;
-  bool lastHidden, funcHidden, tdefHidden;
-  bool funcDone;           // the function's parameter list is closed
+  Cand last, func, tdef;
+  bool funcDone;          // the function's parameter list is closed
   bool body;               // the braces open are its body
   bool isTypedef, init, tag, sawEnum;
   int enumBrace;           // brace depth inside an enum's braces, 0 if not in one
 };
 
-static void scanInit(Scanner *sc, Table *t, int file, bool words, bool header) {
+static void scanInit(Scanner *sc, Table *t, int file, bool words, bool header, const char *path) {
   memset(sc, 0, sizeof *sc);
   sc->t = t;
   sc->file = file;
   sc->words = words;
   sc->header = header;
+  sc->path = arenaStr(&t->str, path, (int)strlen(path));
 }
 
 static void endStmt(Scanner *sc) {
-  sc->stmtLen = sc->lastLen = sc->funcLen = sc->tdefLen = 0;
+  sc->stmtLen = sc->last.len = sc->func.len = sc->tdef.len = 0;
   sc->funcDone = sc->body = sc->isTypedef = sc->init = sc->tag = sc->sawEnum = false;
 }
 
@@ -221,40 +253,52 @@ static void append(Scanner *sc, const char *s, int n, bool space) {
   for (int i = 0; i < n && sc->stmtLen < SIG_MAX; i++) sc->stmt[sc->stmtLen++] = s[i];
 }
 
-static void keep(char *dst, int *dstLen, bool *hidden, const char *s, int n, bool h) {
+// s[0, n) of the line being scanned.
+static void keep(Scanner *sc, Cand *c, const char *s, int n, bool h) {
   if (n > NAME_MAX) n = NAME_MAX;
-  memcpy(dst, s, n);
-  *dstLen = n;
-  *hidden = h;
+  memcpy(c->s, s, n);
+  c->len = n;
+  c->hidden = h;
+  c->y = sc->y;
+  c->x = (int)(s - sc->line);
 }
 
-static void decl(Scanner *sc, const char *s, int n, uint8_t kind, const char *sig, int sigLen) {
-  add(sc->t, s, n, kind, sig, sigLen, sc->file);
+static void decl(Scanner *sc, const char *s, int n, uint8_t kind, const char *sig, int sigLen, int y, int x, bool def) {
+  add(sc->t, s, n, kind, sig, sigLen, sc->file, Loc{sc->path, y, x, def});
+}
+
+// A name in the line being scanned, declared there.
+static void declHere(Scanner *sc, const char *s, int n, uint8_t kind, const char *sig, int sigLen) {
+  decl(sc, s, n, kind, sig, sigLen, sc->y, (int)(s - sc->line), kind != K_WORD);
+}
+
+static void declCand(Scanner *sc, const Cand *c, uint8_t kind, const char *sig, int sigLen, bool def) {
+  decl(sc, c->s, c->len, kind, sig, sigLen, c->y, c->x, def);
 }
 
 // A global: the last name, declared by the statement so far (without the = ; , [ that ends it).
 static void varDecl(Scanner *sc) {
-  if (!sc->lastLen || sc->lastHidden) { sc->lastLen = 0; return; }
+  if (!sc->last.len || sc->last.hidden) { sc->last.len = 0; return; }
   int n = sc->stmtLen;
   while (n && strchr("=;,[ ", sc->stmt[n - 1])) n--;
-  decl(sc, sc->last, sc->lastLen, K_VAR, sc->stmt, n);
-  sc->lastLen = 0;
+  declCand(sc, &sc->last, K_VAR, sc->stmt, n, !contains(sc->stmt, sc->stmtLen, "extern"));
+  sc->last.len = 0;
 }
 
 // typedef ... name;  or  typedef ret (*name)(...);
 static void typedefDecl(Scanner *sc) {
-  if (sc->tdefLen) {
-    if (!sc->tdefHidden) decl(sc, sc->tdef, sc->tdefLen, K_TYPE, nullptr, 0);
-  } else if (sc->lastLen && !sc->lastHidden) {
-    decl(sc, sc->last, sc->lastLen, K_TYPE, nullptr, 0);
+  if (sc->tdef.len) {
+    if (!sc->tdef.hidden) declCand(sc, &sc->tdef, K_TYPE, nullptr, 0, true);
+  } else if (sc->last.len && !sc->last.hidden) {
+    declCand(sc, &sc->last, K_TYPE, nullptr, 0, true);
   }
-  sc->lastLen = sc->tdefLen = 0;
+  sc->last.len = sc->tdef.len = 0;
 }
 
 static void name(Scanner *sc, const char *s, int n, bool code, bool space, bool excluded) {
   const int kw = keyword(s, n);
   if (!code) {   // a directive's text
-    if (kw < 0 && !excluded && sc->words && n > 1) decl(sc, s, n, K_WORD, nullptr, 0);
+    if (kw < 0 && !excluded && sc->words && n > 1) declHere(sc, s, n, K_WORD, nullptr, 0);
     return;
   }
   if (sc->brace == 0) append(sc, s, n, space);
@@ -274,18 +318,17 @@ static void name(Scanner *sc, const char *s, int n, bool code, bool space, bool 
   const bool hidden = excluded || (sc->header && s[0] == '_');
   if (sc->tag) {
     sc->tag = false;
-    if (!hidden) decl(sc, s, n, K_TYPE, nullptr, 0);
+    if (!hidden) declHere(sc, s, n, K_TYPE, nullptr, 0);
     return;
   }
   if (n > 1 && s[0] == '_' && s[1] == '_') { sc->prev = 'k'; return; }   // __attribute__ and such
   if (sc->enumBrace && sc->brace == sc->enumBrace && sc->paren == 0 && (before == '{' || before == ',')) {
-    if (!hidden) decl(sc, s, n, K_MACRO, nullptr, 0);   // an enum constant
+    if (!hidden) declHere(sc, s, n, K_MACRO, nullptr, 0);   // an enum constant
     return;
   }
-  if (sc->words && !hidden && n > 1) decl(sc, s, n, K_WORD, nullptr, 0);
-  if (top && !sc->init) keep(sc->last, &sc->lastLen, &sc->lastHidden, s, n, hidden);
-  if (sc->isTypedef && sc->paren > 0 && before == '*' && !sc->tdefLen)
-    keep(sc->tdef, &sc->tdefLen, &sc->tdefHidden, s, n, hidden);
+  if (sc->words && !hidden && n > 1) declHere(sc, s, n, K_WORD, nullptr, 0);
+  if (top && !sc->init) keep(sc, &sc->last, s, n, hidden);
+  if (sc->isTypedef && sc->paren > 0 && before == '*' && !sc->tdef.len) keep(sc, &sc->tdef, s, n, hidden);
 }
 
 static void punct(Scanner *sc, char c, bool space, char next, char before) {
@@ -293,30 +336,35 @@ static void punct(Scanner *sc, char c, bool space, char next, char before) {
   if (sc->brace == 0) append(sc, &c, 1, space);
   switch (c) {
     case '(':
-      if (top && sc->prev == 'a' && sc->lastLen && !sc->isTypedef && !sc->init && !sc->funcLen)
-        keep(sc->func, &sc->funcLen, &sc->funcHidden, sc->last, sc->lastLen, sc->lastHidden);
+      if (top && sc->prev == 'a' && sc->last.len && !sc->isTypedef && !sc->init && !sc->func.len)
+        sc->func = sc->last;
       sc->paren++;
       break;
     case ')':
       if (sc->paren > 0) sc->paren--;
-      if (sc->paren == 0 && sc->brace == 0 && sc->funcLen && !sc->funcDone) {
+      if (sc->paren == 0 && sc->brace == 0 && sc->func.len && !sc->funcDone) {
         sc->funcDone = true;
-        if (!sc->funcHidden) decl(sc, sc->func, sc->funcLen, K_FUNC, sc->stmt, sc->stmtLen);
+        if (!sc->func.hidden) declCand(sc, &sc->func, K_FUNC, sc->stmt, sc->stmtLen, false);
       }
       break;
     case '[':   // an array: its name is complete
       if (top && !sc->init) {
         if (!sc->isTypedef) {
           if (!sc->funcDone) varDecl(sc);
-        } else if (!sc->tdefLen) {
-          keep(sc->tdef, &sc->tdefLen, &sc->tdefHidden, sc->last, sc->lastLen, sc->lastHidden);
+        } else if (!sc->tdef.len) {
+          sc->tdef = sc->last;
         }
       }
       sc->bracket++;
       break;
     case ']': if (sc->bracket > 0) sc->bracket--; break;
     case '{':
-      if (sc->brace == 0) { sc->body = sc->funcDone; sc->tag = false; }
+      if (sc->brace == 0) {
+        sc->body = sc->funcDone;
+        sc->tag = false;
+        // the function's body: this is its definition
+        if (sc->body && sc->func.len && !sc->func.hidden) declCand(sc, &sc->func, K_FUNC, sc->stmt, sc->stmtLen, true);
+      }
       if (sc->sawEnum && !sc->funcDone) sc->enumBrace = sc->brace + 1;
       sc->sawEnum = false;
       sc->brace++;
@@ -337,7 +385,7 @@ static void punct(Scanner *sc, char c, bool space, char next, char before) {
         if (sc->init) sc->init = false;
         else if (sc->isTypedef) typedefDecl(sc);
         else if (!sc->funcDone) varDecl(sc);
-        sc->lastLen = 0;
+        sc->last.len = 0;
       }
       break;
     case ';':
@@ -394,7 +442,7 @@ static bool directive(Scanner *sc, const char *s, int len, int *i) {
         if (close) e = (int)(close - s) + 1;
       }
       char sig[SIG_MAX];
-      decl(sc, s + na, nn, K_MACRO, sig, tidy(sig, s + na, e - na));
+      declHere(sc, s + na, nn, K_MACRO, sig, tidy(sig, s + na, e - na));
     }
   }
   *i = p;
@@ -408,8 +456,10 @@ static void skipDirective(Scanner *sc, const char *s, int len, int i) {
   else if (is(s + a, p - a, "endif") && --sc->ifDepth == 0) sc->skip = false;
 }
 
-// One line. exX: the column of a name to leave out (the word being typed), or -1.
-static void scanLine(Scanner *sc, const char *s, int len, int exX) {
+// Line y. exX: the column of a name to leave out (the word being typed), or -1.
+static void scanLine(Scanner *sc, int y, const char *s, int len, int exX) {
+  sc->y = y;
+  sc->line = s;
   int i = 0;
   while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
   if (sc->skip) {
@@ -466,34 +516,52 @@ static void scanLine(Scanner *sc, const char *s, int len, int exX) {
   }
 }
 
-static void scanFile(Table *t, const char *path, int file, bool header) {
+// A whole file, malloc'ed (in PSRAM); null if it can't be read or is empty or too big.
+static char *readAll(const char *path, int *n) {
+  *n = 0;
   FILE *f = fopen(path, "rb");
-  if (!f) return;
+  if (!f) return nullptr;
   fseek(f, 0, SEEK_END);
   const long size = ftell(f);
   fseek(f, 0, SEEK_SET);
   char *buf = size > 0 && size < 512 * 1024 ? (char *)psRealloc(nullptr, size) : nullptr;
-  const int n = buf ? (int)fread(buf, 1, size, f) : 0;
+  if (buf) *n = (int)fread(buf, 1, size, f);
   fclose(f);
+  return buf;
+}
+
+// The next line of buf[0, n) from *p: its length (without CR), *p moved past it.
+static int nextLine(const char *buf, int n, int *p) {
+  const char *eol = (const char *)memchr(buf + *p, '\n', n - *p);
+  const int e = eol ? (int)(eol - buf) : n;
+  int l = e - *p;
+  if (l && buf[*p + l - 1] == '\r') l--;
+  *p = e + 1;
+  return l;
+}
+
+static void scanFile(Table *t, const char *path, int file, bool header) {
+  int n;
+  char *buf = readAll(path, &n);
+  if (!buf) return;
   Scanner sc;
-  scanInit(&sc, t, file, false, header);
-  for (int p = 0; p < n;) {
-    const char *eol = (const char *)memchr(buf + p, '\n', n - p);
-    int e = eol ? (int)(eol - buf) : n, l = e - p;
-    if (l && buf[p + l - 1] == '\r') l--;
-    scanLine(&sc, buf + p, l, -1);
-    p = e + 1;
+  scanInit(&sc, t, file, false, header, path);
+  for (int p = 0, y = 0; p < n; y++) {
+    const char *s = buf + p;
+    scanLine(&sc, y, s, nextLine(buf, n, &p), -1);
   }
   free(buf);
 }
 
 // ---- the indexes ----
 
-static Table s_hdr, s_proj, s_live;
-static char s_incDir[128], s_projDir[192];
-static bool s_hdrOk, s_projOk;
-static char *s_files[MAX_FILES];
+static Table s_hdr, s_proj, s_live, s_lib;
+static char s_incDir[128], s_libDir[128], s_projDir[192];
+static bool s_hdrOk, s_libOk, s_projOk;
+static char *s_files[MAX_FILES];   // the project's, then the other projects' it includes
 static int s_nfiles;
+static char *s_extra[MAX_FILES];
+static int s_nextra;
 static bool s_fileOpen[MAX_FILES];
 
 static bool isDir(const char *path) {
@@ -506,7 +574,7 @@ static bool endsWith(const char *s, const char *end) {
   return a > b && !strcmp(s + a - b, end);
 }
 
-// The .h files (or .c/.h with `sources`) of a folder, malloc'ed full paths; folders too if depth > 0.
+// The .h files (or .c/.cpp/.h with `sources`) of a folder, malloc'ed full paths; folders too if depth > 0.
 static int listDir(const char *dir, bool sources, int depth, char **out, int max) {
   char *names[64];
   int nn = 0, n = 0;
@@ -519,7 +587,7 @@ static int listDir(const char *dir, bool sources, int depth, char **out, int max
     char path[256];
     snprintf(path, sizeof path, "%s/%s", dir, names[i]);
     free(names[i]);
-    if (endsWith(path, ".h") || (sources && endsWith(path, ".c"))) {
+    if (endsWith(path, ".h") || (sources && (endsWith(path, ".c") || endsWith(path, ".cpp")))) {
       if (n < max) out[n++] = strdup(path);
     } else if (depth > 0 && isDir(path)) {
       n += listDir(path, sources, depth - 1, out + n, max - n);
@@ -532,7 +600,7 @@ static void buildIndexes() {
   if (!s_hdrOk) {
     tableReset(&s_hdr);
     for (int i = 0; i < N_KEYWORDS; i++)
-      add(&s_hdr, kKeywords[i].s, (int)strlen(kKeywords[i].s), kKeywords[i].kind, nullptr, 0, -1);
+      add(&s_hdr, kKeywords[i].s, (int)strlen(kKeywords[i].s), kKeywords[i].kind, nullptr, 0, -1, Loc{});
     char *files[MAX_FILES];
     const int n = s_incDir[0] ? listDir(s_incDir, false, 1, files, MAX_FILES) : 0;
     for (int i = 0; i < n; i++) {
@@ -545,6 +613,7 @@ static void buildIndexes() {
     tableReset(&s_proj);
     for (int i = 0; i < s_nfiles; i++) free(s_files[i]);
     s_nfiles = s_projDir[0] ? listDir(s_projDir, true, 0, s_files, MAX_FILES) : 0;
+    for (int i = 0; i < s_nextra && s_nfiles < MAX_FILES; i++) s_files[s_nfiles++] = strdup(s_extra[i]);
     for (int i = 0; i < s_nfiles; i++) scanFile(&s_proj, s_files[i], i, false);
     s_projOk = true;
   }
@@ -558,8 +627,8 @@ static void readOpenFiles(Doc *const *docs, int ndocs, const Doc *cur, int exX) 
   for (int i = 0; i < ndocs; i++) {
     const Doc *d = docs[i];
     Scanner sc;
-    scanInit(&sc, &s_live, -1, true, false);
-    for (int y = 0; y < d->n; y++) scanLine(&sc, d->ln[y].s, d->ln[y].len, d == cur && y == cur->cy ? exX : -1);
+    scanInit(&sc, &s_live, -1, true, false, d->path);
+    for (int y = 0; y < d->n; y++) scanLine(&sc, y, d->ln[y].s, d->ln[y].len, d == cur && y == cur->cy ? exX : -1);
   }
   for (int f = 0; f < s_nfiles; f++) {
     s_fileOpen[f] = false;
@@ -578,13 +647,37 @@ static const Sym *declOf(const char *s, int n) {
   return i >= 0 ? &s_hdr.v[i] : nullptr;
 }
 
-void ac_project(const char *includeDir, const char *projDir) {
+// The library sources, read on the first F9.
+static void buildLib() {
+  if (s_libOk) return;
+  tableReset(&s_lib);
+  char *files[MAX_FILES];
+  const int n = s_libDir[0] ? listDir(s_libDir, true, 1, files, MAX_FILES) : 0;
+  for (int i = 0; i < n; i++) {
+    scanFile(&s_lib, files[i], -1, false);
+    free(files[i]);
+  }
+  s_libOk = true;
+}
+
+void ac_project(const char *includeDir, const char *libDir, const char *projDir) {
   ac_close();
   if (strcmp(includeDir, s_incDir)) {
     snprintf(s_incDir, sizeof s_incDir, "%s", includeDir);
     s_hdrOk = false;
   }
+  if (strcmp(libDir, s_libDir)) {
+    snprintf(s_libDir, sizeof s_libDir, "%s", libDir);
+    s_libOk = false;
+  }
   snprintf(s_projDir, sizeof s_projDir, "%s", projDir);
+  s_projOk = false;
+}
+
+void ac_extra(const char *const *paths, int n) {
+  for (int i = 0; i < s_nextra; i++) free(s_extra[i]);
+  s_nextra = 0;
+  for (int i = 0; i < n && s_nextra < MAX_FILES; i++) s_extra[s_nextra++] = strdup(paths[i]);
   s_projOk = false;
 }
 
@@ -750,3 +843,273 @@ void ac_draw(const Doc *d, int y0, int rows) {
 }
 
 const char *ac_hint() { return s_open ? s_items[s_sel].s->sig : nullptr; }
+
+// ---- go to the declaration (F9) ----
+
+// Reads C text line by line, enough to tell a declaration of a name by its look: right after a
+// type (`int x`, `Foo *x`, `int a, x`) and followed by ; , = [ ( ) or the line's end, not after
+// '=' or in an expression. Comments, strings and directives are skipped; braces are counted.
+struct Finder {
+  const char *w;           // the name looked for, or null
+  int wn;
+  bool members;            // only inside struct/union braces
+  bool inComment, contLine;
+  char prev;               // last token: 'a' name or type word, 't' struct/union/enum, 'k' other
+                           // keyword, '*' after a type, else the punctuation
+  bool first, typeStmt;    // this statement (or parenthesis): at its first name, which is a type
+  bool init, tag, paren;   // this statement: after '=', struct/union seen, '(' seen
+  uint32_t agg;            // bit i: the braces at depth i + 1 are a struct's or union's
+  int depth;
+  int topLine, funcLine;   // where the file-scope statement began; the open braces' one, or -1
+  bool topNext;
+};
+
+static void finderInit(Finder *f, const char *w, int wn, bool members) {
+  memset(f, 0, sizeof *f);
+  f->w = w;
+  f->wn = wn;
+  f->members = members;
+  f->first = f->topNext = true;
+  f->funcLine = -1;
+}
+
+static void stmtStart(Finder *f, char c) {
+  f->prev = c;
+  f->first = true;
+  f->typeStmt = f->init = f->tag = f->paren = false;
+}
+
+static bool qualifier(const char *s, int n) {
+  static const char *const kWords[] = {"const", "static", "extern", "volatile", "register", "inline", "unsigned", "signed"};
+  for (const char *k : kWords)
+    if (is(s, n, k)) return true;
+  return false;
+}
+
+// A name that starts a declaration: a C type, a qualifier, struct..., a typedef, or a *_t.
+static bool typeName(const char *s, int n) {
+  const int kw = keyword(s, n);
+  if (kw >= 0) return kKeywords[kw].kind == K_TYPE || qualifier(s, n) || is(s, n, "struct") || is(s, n, "union") || is(s, n, "enum");
+  if (n > 2 && s[n - 2] == '_' && s[n - 1] == 't') return true;
+  const Sym *y = declOf(s, n);
+  return y && y->kind == K_TYPE;
+}
+
+// Line y up to the tokens that start after column maxX. Returns the column of the last
+// declaration of the name looked for in it, or -1.
+static int finderLine(Finder *f, const char *s, int len, int y, int maxX) {
+  int i = 0, found = -1;
+  while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+  if (!f->inComment && (f->contLine || (i < len && s[i] == '#'))) {
+    f->contLine = len && s[len - 1] == '\\';
+    if (f->depth == 0) f->topNext = true;
+    return -1;
+  }
+  f->contLine = false;
+  while (i < len && i <= maxX) {
+    if (f->inComment) {
+      while (i + 1 < len && !(s[i] == '*' && s[i + 1] == '/')) i++;
+      if (i + 1 < len) { i += 2; f->inComment = false; }
+      else i = len;
+      continue;
+    }
+    const char c = s[i];
+    if (c == ' ' || c == '\t' || c == '\r') { i++; continue; }
+    if (c == '/' && i + 1 < len && s[i + 1] == '/') break;
+    if (c == '/' && i + 1 < len && s[i + 1] == '*') { f->inComment = true; i += 2; continue; }
+    if (f->depth == 0 && f->topNext) { f->topLine = y; f->topNext = false; }
+    const int start = i;
+    if (c == '"' || c == '\'') {
+      for (i++; i < len && s[i] != c; i++)
+        if (s[i] == '\\') i++;
+      if (i < len) i++;
+      f->prev = '"';
+      f->first = false;
+      continue;
+    }
+    if (isDigit(c)) {
+      while (i < len && (identChar(s[i]) || s[i] == '.')) i++;
+      f->prev = '0';
+      f->first = false;
+      continue;
+    }
+    if (identChar(c)) {
+      while (i < len && identChar(s[i])) i++;
+      const int n = i - start;
+      if (f->w && n == f->wn && !memcmp(s + start, f->w, n) && !f->init &&
+          (f->prev == 'a' || ((f->prev == '*' || f->prev == ',') && f->typeStmt)) &&
+          (!f->members || (f->depth > 0 && f->depth <= 32 && (f->agg >> (f->depth - 1) & 1)))) {
+        int j = i;
+        while (j < len && (s[j] == ' ' || s[j] == '\t')) j++;
+        if (j == len || !(identChar(s[j]) || s[j] == '*')) found = start;   // not a type itself
+      }
+      const int kw = keyword(s + start, n);
+      if (is(s + start, n, "struct") || is(s + start, n, "union") || is(s + start, n, "enum")) {
+        f->prev = 't';
+        if (s[start] != 'e') f->tag = true;
+      } else if (kw >= 0 && kKeywords[kw].kind != K_TYPE && !qualifier(s + start, n)) {
+        f->prev = 'k';   // return, case, sizeof...
+      } else {
+        f->prev = 'a';
+      }
+      if (f->first) { f->typeStmt = typeName(s + start, n); f->first = false; }
+      continue;
+    }
+    i++;
+    switch (c) {
+      case '*': f->prev = f->prev == 'a' || f->prev == '*' ? '*' : 'o'; break;
+      case '=':
+        if ((i >= len || s[i] != '=') && (start == 0 || !strchr("=!<>+-*/%&|^", s[start - 1]))) f->init = true;
+        f->prev = c;
+        break;
+      case ',': f->init = false; f->prev = c; break;
+      case '(': f->paren = f->first = true; f->typeStmt = false; f->prev = c; break;
+      case '{':
+        if (f->depth == 0) f->funcLine = f->topLine;
+        if (f->depth < 32) {
+          if (f->tag && !f->paren) f->agg |= 1u << f->depth;
+          else f->agg &= ~(1u << f->depth);
+        }
+        f->depth++;
+        stmtStart(f, c);
+        break;
+      case '}':
+        if (f->depth > 0) f->depth--;
+        stmtStart(f, c);
+        if (f->depth == 0) { f->topNext = true; f->funcLine = -1; }
+        break;
+      case ';':
+        stmtStart(f, c);
+        if (f->depth == 0) f->topNext = true;
+        break;
+      default: f->prev = c; break;
+    }
+  }
+  return found;
+}
+
+// A local variable or parameter: the last declaration of w up to column x0 of the cursor line,
+// in the function the cursor is in.
+static bool findLocal(const Doc *d, const char *w, int n, int x0, int *fy, int *fx) {
+  Finder f;
+  finderInit(&f, nullptr, 0, false);
+  for (int y = 0; y <= d->cy; y++) finderLine(&f, d->ln[y].s, d->ln[y].len, y, y == d->cy ? x0 : INT_MAX);
+  if (f.depth == 0 || f.funcLine < 0) return false;
+  const int from = f.funcLine;
+  finderInit(&f, w, n, false);
+  *fy = -1;
+  for (int y = from; y <= d->cy; y++) {
+    const int x = finderLine(&f, d->ln[y].s, d->ln[y].len, y, y == d->cy ? x0 : INT_MAX);
+    if (x >= 0) { *fy = y; *fx = x; }
+  }
+  return *fy >= 0;
+}
+
+static bool findInDoc(const Doc *d, const char *w, int n, bool members, int *fy, int *fx) {
+  Finder f;
+  finderInit(&f, w, n, members);
+  for (int y = 0; y < d->n; y++)
+    if ((*fx = finderLine(&f, d->ln[y].s, d->ln[y].len, y, INT_MAX)) >= 0) { *fy = y; return true; }
+  return false;
+}
+
+static bool findInFile(const char *path, const char *w, int n, bool members, int *fy, int *fx) {
+  int size;
+  char *buf = readAll(path, &size);
+  if (!buf) return false;
+  Finder f;
+  finderInit(&f, w, n, members);
+  bool ok = false;
+  for (int p = 0, y = 0; p < size && !ok; y++) {
+    const char *s = buf + p;
+    if ((*fx = finderLine(&f, s, nextLine(buf, size, &p), y, INT_MAX)) >= 0) { *fy = y; ok = true; }
+  }
+  free(buf);
+  return ok;
+}
+
+// A global's place: a definition rather than a prototype or an extern; the open files first,
+// then the project's other files, then the library sources (a header's function, defined), then
+// the headers.
+static const Sym *declSite(const char *s, int n) {
+  const Sym *c[4] = {};
+  int i = find(&s_live, s, n);
+  if (i >= 0 && s_live.v[i].kind != K_WORD) c[0] = &s_live.v[i];
+  i = find(&s_proj, s, n);
+  if (i >= 0 && !s_fileOpen[s_proj.v[i].file]) c[1] = &s_proj.v[i];
+  i = find(&s_hdr, s, n);
+  if (i >= 0) c[3] = &s_hdr.v[i];
+  if (c[3] && !c[3]->def) {   // only declared in a header: its definition in the library
+    buildLib();
+    i = find(&s_lib, s, n);
+    if (i >= 0 && s_lib.v[i].kind == c[3]->kind) c[2] = &s_lib.v[i];
+  }
+  for (int k = 0; k < 4; k++)
+    if (c[k] && c[k]->path && c[k]->def) return c[k];
+  for (int k = 0; k < 4; k++)
+    if (c[k] && c[k]->path) return c[k];
+  return nullptr;
+}
+
+bool ac_find_decl(Doc *const *docs, int ndocs, Doc *d, char *name, int nameSize, char *path, int pathSize,
+                  int *line, int *col) {
+  ac_close();
+  name[0] = 0;
+  const DocLine *l = &d->ln[d->cy];
+  int x0 = d->cx < l->len && identChar(l->s[d->cx]) ? d->cx : d->cx - 1;
+  if (x0 < 0 || x0 >= l->len || !identChar(l->s[x0])) return false;
+  while (x0 > 0 && identChar(l->s[x0 - 1])) x0--;
+  int x1 = x0;
+  while (x1 < l->len && identChar(l->s[x1])) x1++;
+  const int n = x1 - x0;
+  if (isDigit(l->s[x0]) || n > NAME_MAX) return false;
+  char w[NAME_MAX + 1];
+  memcpy(w, l->s + x0, n);
+  w[n] = 0;
+  snprintf(name, nameSize, "%s", w);
+  if (keyword(w, n) >= 0) return false;
+  readOpenFiles(docs, ndocs, nullptr, -1);
+  int b = x0;   // after . or -> it is a struct member
+  while (b > 0 && l->s[b - 1] == ' ') b--;
+  const bool member = b > 0 && (l->s[b - 1] == '.' || (b > 1 && l->s[b - 1] == '>' && l->s[b - 2] == '-'));
+  if (!member) {
+    if (findLocal(d, w, n, x0, line, col)) {
+      snprintf(path, pathSize, "%s", d->path);
+      return true;
+    }
+    if (const Sym *y = declSite(w, n)) {
+      snprintf(path, pathSize, "%s", y->path);
+      *line = y->line;
+      *col = y->col;
+      return true;
+    }
+  }
+  // a member, or a name the scanner doesn't take as global (a static local, a parameter...):
+  // the first that looks like its declaration, in this file, the open ones, the project's, the headers
+  const Doc *order[MAX_FILES + 1];
+  int no = 0;
+  order[no++] = d;
+  for (int i = 0; i < ndocs && no <= MAX_FILES; i++)
+    if (docs[i] != d) order[no++] = docs[i];
+  for (int i = 0; i < no; i++)
+    if (findInDoc(order[i], w, n, member, line, col)) {
+      snprintf(path, pathSize, "%s", order[i]->path);
+      return true;
+    }
+  for (int f = 0; f < s_nfiles; f++)
+    if (!s_fileOpen[f] && findInFile(s_files[f], w, n, member, line, col)) {
+      snprintf(path, pathSize, "%s", s_files[f]);
+      return true;
+    }
+  char *files[MAX_FILES];
+  const int nh = s_incDir[0] ? listDir(s_incDir, false, 1, files, MAX_FILES) : 0;
+  bool ok = false;
+  for (int i = 0; i < nh; i++) {
+    if (!ok && findInFile(files[i], w, n, member, line, col)) {
+      snprintf(path, pathSize, "%s", files[i]);
+      ok = true;
+    }
+    free(files[i]);
+  }
+  return ok;
+}

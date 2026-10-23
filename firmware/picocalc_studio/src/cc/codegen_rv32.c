@@ -73,12 +73,7 @@ static int sym_index(char *name) {
 }
 
 static void data_reloc(uint32_t offset, int sym, int32_t addend) {
-  if (out->nrelocs == out->caprelocs) {
-    int cap = out->caprelocs ? out->caprelocs * 2 : 64;
-    out->relocs = cc_grow(out->relocs, sizeof(CcReloc) * out->caprelocs, sizeof(CcReloc) * cap);
-    out->caprelocs = cap;
-  }
-  out->relocs[out->nrelocs++] = (CcReloc){CC_DATA, offset, CC_R_ABS32, sym, addend, 0};
+  *cc_new_reloc(out) = (CcReloc){.offset = offset, .addend = addend, .sym = sym, .sect = CC_DATA, .type = CC_R_ABS32};
 }
 
 static void add_line(Token *tok) {
@@ -150,7 +145,16 @@ static void amo(int f5, int rd, int rs2, int rs1) {
 
 static void libcall(char *name) { rv_call_sym(sym_index(name), cur_line); }
 
-static bool is_flt(Type *ty) { return ty->kind == TY_FLOAT; }
+#if defined(__riscv) && !defined(__riscv_flen)
+int cc_soft_float = 1;
+#else
+int cc_soft_float = 0;
+#endif
+
+// is_flt: a float in an FP register (fa0, ft0, fs*). With cc_soft_float a float is a 32-bit
+// integer value in a0 instead, and is_sflt holds; its arithmetic calls libgcc.
+static bool is_flt(Type *ty) { return ty->kind == TY_FLOAT && !cc_soft_float; }
+static bool is_sflt(Type *ty) { return ty->kind == TY_FLOAT && cc_soft_float; }
 static bool is_dbl(Type *ty) { return ty->kind == TY_DOUBLE || ty->kind == TY_LDOUBLE; }
 static bool is_i64(Type *ty) { return ty->kind == TY_LONG; }
 static bool is_wide(Type *ty) { return is_i64(ty) || is_dbl(ty); }
@@ -382,6 +386,8 @@ static void addr_to(int rd, Addr a) {
 
 // Loads a value of type ty from a into the accumulator.
 static void load_from(Type *ty, Addr a) {
+  if (is_sflt(ty))
+    ty = ty_uint;
   switch (ty->kind) {
   case TY_ARRAY:
   case TY_STRUCT:
@@ -422,6 +428,8 @@ static void load(Type *ty) { load_from(ty, base_addr(A0, 0)); }
 
 // Stores the accumulator (a struct: the struct at the address in a0) to a.
 static void store_to(Type *ty, Addr a) {
+  if (is_sflt(ty))
+    ty = ty_uint;
   switch (ty->kind) {
   case TY_STRUCT:
   case TY_UNION:
@@ -516,7 +524,7 @@ static Addr gen_lvalue(Node *node) {
     }
     if (var->is_tls)
       error_tok(node->tok, "thread-local variables are not supported");
-    return (Addr){0, 0, sym_index(var->name)};
+    return (Addr){0, var->offset, sym_index(var->name)};  // offset: see codegen_string()
   }
   case ND_MEMBER: {
     Addr a = gen_lvalue(node->lhs);
@@ -652,9 +660,10 @@ static void narrow(int id) { narrow_reg(A0, id); }
 
 // a0 = (accumulator != 0)
 static void to_bool(Type *ty) {
-  if (is_flt(ty)) {
-    fmv_x_w(T0, FA0);
-    slli(T0, T0, 1);  // ignore the sign: -0.0 is false
+  if (is_flt(ty) || is_sflt(ty)) {
+    if (is_flt(ty))
+      fmv_x_w(T0, FA0);
+    slli(T0, is_flt(ty) ? T0 : A0, 1);  // ignore the sign: -0.0 is false
     snez(A0, T0);
   } else if (is_dbl(ty)) {
     slli(T0, A1, 1);
@@ -671,9 +680,10 @@ static void to_bool(Type *ty) {
 // Branches to label if the accumulator (of type ty) is zero (if_zero) or nonzero.
 static void branch_zero(Type *ty, int label, bool if_zero) {
   int r = A0;
-  if (is_flt(ty)) {
-    fmv_x_w(T0, FA0);
-    slli(T0, T0, 1);
+  if (is_flt(ty) || is_sflt(ty)) {
+    if (is_flt(ty))
+      fmv_x_w(T0, FA0);
+    slli(T0, is_flt(ty) ? T0 : A0, 1);
     r = T0;
   } else if (is_dbl(ty)) {
     slli(T0, A1, 1);
@@ -726,10 +736,15 @@ static void cast(Type *from, Type *to) {
       libcall("__fixsfdi");
     else if (t2 == U64)
       libcall("__fixunssfdi");
+    else if (t2 == U32 && cc_soft_float)
+      libcall("__fixunssfsi");
     else if (t2 == U32)
       rv_fp(0x60, 1, FA0, 1, A0);  // fcvt.wu.s a0, fa0, rtz
     else {
-      rv_fp(0x60, 0, FA0, 1, A0);  // fcvt.w.s a0, fa0, rtz
+      if (cc_soft_float)
+        libcall("__fixsfsi");
+      else
+        rv_fp(0x60, 0, FA0, 1, A0);  // fcvt.w.s a0, fa0, rtz
       narrow(t2);
     }
     return;
@@ -757,7 +772,9 @@ static void cast(Type *from, Type *to) {
     return;
   }
   bool u = t1 == U32;  // smaller unsigned types are zero-extended, so a signed conversion is exact
-  if (t2 == F32)
+  if (t2 == F32 && cc_soft_float)
+    libcall(u ? "__floatunsisf" : "__floatsisf");
+  else if (t2 == F32)
     rv_fp(0x68, u ? 1 : 0, A0, 7, FA0);  // fcvt.s.w[u] fa0, a0
   else
     libcall(u ? "__floatunsidf" : "__floatsidf");
@@ -866,7 +883,7 @@ static bool is_scalar32(Type *ty) {
 }
 
 // Integer, pointer or float of at most 32 bits whose value is in a0 (not fa0).
-static bool is_int32(Type *ty) { return is_scalar32(ty) && !is_flt(ty); }
+static bool is_int32(Type *ty) { return is_scalar32(ty) && ty->kind != TY_FLOAT; }
 
 // A cast that generates no code.
 static bool is_noop_cast(Type *from, Type *to) {
@@ -911,7 +928,12 @@ static bool is_leaf(Node *node) {
 static void gen_leaf(Node *node, int rd) {
   switch (node->kind) {
   case ND_NUM:
-    if (is_flt(node->ty)) {
+    if (is_sflt(node->ty)) {
+      float f = node->fval;
+      uint32_t u;
+      memcpy(&u, &f, 4);
+      rv_li(rd, (int32_t)u);
+    } else if (is_flt(node->ty)) {
       float f = node->fval;
       uint32_t u;
       memcpy(&u, &f, 4);
@@ -972,7 +994,7 @@ static int operand(Node *node, int scratch) {
     node = node->lhs;
   if (node->kind == ND_VAR && node->var->reg)
     return node->var->reg;
-  if (node->kind == ND_NUM && !is_flt(node->ty) && !node->val)
+  if (node->kind == ND_NUM && node->ty->kind != TY_FLOAT && !node->val)
     return ZERO;
   gen_leaf(node, scratch);
   return scratch;
@@ -1072,7 +1094,7 @@ static void gen_funcall(Node *node) {
 
   Type *fty = node->func_ty;
   int nparams = 0;
-  for (Type *t = fty->params; t; t = t->next)
+  while (fty->params && fty->params[nparams])
     nparams++;
   int nargs = 0;
   for (Node *a = node->args; a; a = a->next)
@@ -1426,7 +1448,7 @@ static void gen_binary(Node *node) {
   int a, b;
 
   if (node->kind == ND_SHL || node->kind == ND_SHR) {
-    if (is_flt(rhs->ty) || is_dbl(rhs->ty))
+    if (rhs->ty->kind == TY_FLOAT || is_dbl(rhs->ty))
       error_tok(node->tok, "invalid operand");
     if (is_i64(ty)) {
       // only the low word of the count matters
@@ -1467,6 +1489,24 @@ static void gen_binary(Node *node) {
     case ND_NE: rv_fp(0x50, b, a, 2, A0); xori(A0, A0, 1); return;
     case ND_LT: rv_fp(0x50, b, a, 1, A0); return;
     case ND_LE: rv_fp(0x50, b, a, 0, A0); return;
+    default: error_tok(node->tok, "invalid expression");
+    }
+  }
+
+  if (is_sflt(ty)) {
+    gen_expr(rhs);
+    push();
+    gen_expr(lhs);
+    pop(A1);
+    switch (node->kind) {
+    case ND_ADD: libcall("__addsf3"); return;
+    case ND_SUB: libcall("__subsf3"); return;
+    case ND_MUL: libcall("__mulsf3"); return;
+    case ND_DIV: libcall("__divsf3"); return;
+    case ND_EQ: libcall("__eqsf2"); seqz(A0, A0); return;
+    case ND_NE: libcall("__nesf2"); snez(A0, A0); return;
+    case ND_LT: libcall("__ltsf2"); rv_opi(2, A0, A0, 0); return;  // slti a0, a0, 0
+    case ND_LE: libcall("__lesf2"); rv_opi(2, A0, A0, 1); return;  // slti a0, a0, 1
     default: error_tok(node->tok, "invalid expression");
     }
   }
@@ -1846,6 +1886,7 @@ static void gen_void(Node *node) {
 }
 
 static void gen_expr(Node *node) {
+  check_stack(node->tok);
   int64_t k;
   if (node->kind != ND_NUM && const_int(node, &k)) {
     rv_li(A0, (int32_t)(uint32_t)k);
@@ -1858,8 +1899,8 @@ static void gen_expr(Node *node) {
   case ND_NULL_EXPR:
     return;
   case ND_NUM: {
-    if (is_flt(node->ty)) {
-      gen_leaf(node, FA0);
+    if (node->ty->kind == TY_FLOAT) {
+      gen_leaf(node, is_flt(node->ty) ? FA0 : A0);
     } else if (is_dbl(node->ty)) {
       double d = node->fval;
       uint64_t u;
@@ -1882,6 +1923,9 @@ static void gen_expr(Node *node) {
     gen_expr(node->lhs);
     if (is_flt(node->ty)) {
       rv_fp(0x10, FA0, FA0, 1, FA0);  // fsgnjn.s fa0, fa0, fa0
+    } else if (is_sflt(node->ty)) {
+      rv_li(T0, (int32_t)0x80000000u);
+      rv_op(0, 4, A0, A0, T0);
     } else if (is_dbl(node->ty)) {
       rv_li(T0, (int32_t)0x80000000u);
       rv_op(0, 4, A1, A1, T0);
@@ -2040,6 +2084,7 @@ static void gen_expr(Node *node) {
 //
 
 static void gen_stmt(Node *node) {
+  check_stack(node->tok);
   if (node->tok)
     add_line(node->tok);
 
@@ -2140,6 +2185,12 @@ static void gen_stmt(Node *node) {
     for (Node *n = node->body; n; n = n->next)
       gen_stmt(n);
     return;
+  case ND_PACKED: {
+    CcFnMark m = cc_fn_mark();
+    gen_stmt(cc_unpack(node));
+    cc_node_release(m);
+    return;
+  }
   case ND_GOTO:
     rv_jump(label_of(node->unique_label));
     return;
@@ -2222,6 +2273,12 @@ static void scan(Node *node, int w) {
     if (node->var->is_local)
       node->var->uses += w;
     break;
+  case ND_PACKED: {
+    CcFnMark m = cc_fn_mark();
+    scan(cc_unpack(node), w);
+    cc_node_release(m);
+    return;
+  }
   case ND_ADDR:
     mark_addr(node->lhs);
     break;
@@ -2499,6 +2556,21 @@ static bool all_zero(char *p, int n) {
   return true;
 }
 
+// String literals go in .data as soon as they are parsed. Each is reached as an offset from one
+// local symbol at the start of .data, so it takes no symbol of its own, and its Obj (whose name
+// and offset these are) need not outlive the Nodes that use it (see new_string_literal()).
+void codegen_string(Obj *var, char *data) {
+  static char name[] = ".L..strings";
+  int s = sym_index(name);
+  out->syms[s].sect = CC_DATA;
+  out->syms[s].is_global = 0;
+  CcSection *sect = &out->sect[CC_DATA];
+  sect_align(sect, var->align);
+  var->name = name;
+  var->offset = sect->size;
+  sect_append(sect, data, var->ty->size);
+}
+
 static void emit_data(Obj *prog) {
   for (Obj *var = prog; var; var = var->next) {
     if (var->is_function || !var->is_definition)
@@ -2539,7 +2611,7 @@ static void emit_data(Obj *prog) {
     sym->offset = data->size;
     sect_append(data, var->init_data, size);
     for (Relocation *rel = var->rel; rel; rel = rel->next) {
-      int target = sym_index(*rel->label);
+      int target = sym_index(rel->label);
       // sym_index may have grown the table
       data_reloc(out->syms[s].offset + rel->offset, target, rel->addend);
     }

@@ -6,6 +6,7 @@
 //  * ESP SPI sends bytes in memory order, so RGB565 is byte-swapped into one of P4_NBUF DMA-capable
 //    bounce buffers on the way out. The caller's pixels (in PSRAM) are free once a push returns.
 //  * Commands are short polling transactions issued after every queued pixel transfer finished.
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include "../../../board.h"
 #include <Arduino.h>
 #include <driver/spi_master.h>
@@ -222,3 +223,5 @@ bool p4DisplayInit() {
   hal_lcd_fill(0, 0, LCD_W, LCD_H, 0x0000);
   return true;
 }
+
+#endif  // ESP_PLATFORM

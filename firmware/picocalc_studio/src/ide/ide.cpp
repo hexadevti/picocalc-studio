@@ -22,17 +22,24 @@
 #include "../demo/demo.h"
 #include "../export/export.h"
 
+extern "C" char *cc_normpath(char *path);   // cc/alloc.c
+
 #define ROOT_DIR     "/sd/pico-dev"
 #define PROJECTS_DIR "/sd/pico-dev/projects"
 #define EXAMPLES_DIR "/sd/pico-dev/examples"
 #define INCLUDE_DIR  "/sd/pico-dev/include"
+#define LIB_DIR      "/sd/pico-dev/lib"      // LIB_DIR/<x>/: the sources of the library <x.h>
 #define CFG_PATH     "/sd/pico-dev/ide.cfg"
-#define APPS_DIR     "/sd/apps"
+#define APPS_DIR     "/sd/pico-dev/apps"   // default export folder (F5)
 #define MAX_DOCS     12
 #define MAX_ITEMS    96
+#define MAX_REFS     48
+#define MAX_OTHER    32      // files of other projects a project includes
+#define MAX_BACK     16
 #define OUT_MAX      (16 * 1024)
 #define PANEL_ROWS   7
 #define HINT_COLOR   RGB(230, 230, 160)
+#define REF_COLOR    RGB(120, 200, 230)
 
 
 static jmp_buf s_jmp;
@@ -41,7 +48,7 @@ static Doc *s_docs[MAX_DOCS];
 static int s_ndocs, s_cur;
 static char s_out[OUT_MAX + 1];          // build and program output
 static int s_outLen;
-static bool s_panel;                     // output panel shown under the editor
+static bool s_panel;                     // output panel under the editor: build, errors, program output
 static char s_msg[100];                  // status bar message
 static color_t s_msgColor;
 static char s_errPath[192];              // line marked red: last error or crash
@@ -50,6 +57,22 @@ static char s_find[64];
 static char s_repl[64];
 static char s_battery[16];
 static uint32_t s_batteryAt;
+
+struct Place {
+  char path[192];
+  int y, x;
+};
+static Place s_back[MAX_BACK];           // where F9 (or opening a reference) went from, for Esc
+static int s_nback;
+static Place s_lastEdit;                 // where the last edit left the cursor, for F8
+
+static void pushBack(const Doc *d) {
+  if (s_nback == MAX_BACK) memmove(s_back, s_back + 1, --s_nback * sizeof *s_back);
+  Place &p = s_back[s_nback++];
+  snprintf(p.path, sizeof p.path, "%s", d->path);
+  p.y = d->cy;
+  p.x = d->cx;
+}
 
 // ---- small helpers ----
 
@@ -119,11 +142,14 @@ static ssize_t capWrite(void *, const char *buf, size_t n) {
 
 // ---- settings ----
 
+static char s_exportDir[128] = APPS_DIR;   // where F5 last exported to
+
 static void cfgSave() {
   Doc *d = cur();
   if (!s_proj[0]) return;
   if (FILE *f = fopen(CFG_PATH, "w")) {
-    fprintf(f, "project=%s\nfile=%s\nline=%d\n", s_proj, d ? d->path : "", d ? d->cy + 1 : 1);
+    fprintf(f, "project=%s\nfile=%s\nline=%d\nexportdir=%s\n", s_proj, d ? d->path : "", d ? d->cy + 1 : 1,
+            s_exportDir);
     fclose(f);
   }
 }
@@ -139,6 +165,7 @@ static void cfgLoad(char *proj, char *file, int *line) {
     if (!strncmp(l, "project=", 8)) snprintf(proj, 160, "%s", l + 8);
     else if (!strncmp(l, "file=", 5)) snprintf(file, 192, "%s", l + 5);
     else if (!strncmp(l, "line=", 5)) *line = atoi(l + 5);
+    else if (!strncmp(l, "exportdir=", 10) && l[10]) snprintf(s_exportDir, sizeof s_exportDir, "%s", l + 10);
   }
   fclose(f);
 }
@@ -158,7 +185,24 @@ static void closeDoc(int i) {
   if (s_cur >= i && s_cur > 0) s_cur--;
 }
 
-// Opens (or switches to) a file. A relative path is inside the project.
+static bool inProject(const char *path) {
+  const size_t l = strlen(s_proj);
+  return !strncmp(path, s_proj, l) && path[l] == '/';
+}
+
+// An example opened as it is (not a copy): it can be built and run, not changed.
+static bool isExample() { return !strncmp(s_proj, EXAMPLES_DIR "/", sizeof EXAMPLES_DIR); }
+
+// A reference file: outside the project (a header or library source F9 went to).
+static bool isRef(const Doc *d) { return !inProject(d->path); }
+
+static void readOnlyMsg(const Doc *d) {
+  if (isRef(d)) setMsg(YELLOW, "%s is a library file: read-only", baseName(d->path));
+  else setMsg(YELLOW, "Examples are read-only: \"+ New from example\" copies one");
+}
+
+// Opens (or switches to) a file. A relative path is inside the project; a file outside it (a
+// library header F9 went to) is read-only, and so is all of an example.
 static bool openFile(const char *path) {
   char full[192];
   if (path[0] == '/') snprintf(full, sizeof full, "%s", path);
@@ -172,10 +216,14 @@ static bool openFile(const char *path) {
   }
   Doc *d = doc_open(full);
   if (!d) { setMsg(RED, "Can't open %s", baseName(full)); return false; }
+  d->readOnly = !inProject(full) || isExample();
   s_docs[s_ndocs] = d;
   s_cur = s_ndocs++;
   return true;
 }
+
+static void reindex();
+static int otherFiles(char **out);
 
 static bool saveAll() {
   for (int i = 0; i < s_ndocs; i++)
@@ -183,7 +231,7 @@ static bool saveAll() {
       setMsg(RED, "Can't save %s", baseName(s_docs[i]->path));
       return false;
     }
-  ac_project(INCLUDE_DIR, s_proj);   // the saved text is the project's names now
+  reindex();   // the saved text is the project's names now
   return true;
 }
 
@@ -206,14 +254,16 @@ static bool closeProject() {
   s_cur = 0;
   s_proj[0] = 0;
   s_errPath[0] = 0;
-  ac_project(INCLUDE_DIR, "");
+  s_nback = 0;
+  ac_project(INCLUDE_DIR, LIB_DIR, "");
+  ac_extra(nullptr, 0);
   return true;
 }
 
 // Opens a project folder and `file` in it, or its main.c / first source file.
 static bool openProject(const char *dir, const char *file) {
   snprintf(s_proj, sizeof s_proj, "%s", dir);
-  ac_project(INCLUDE_DIR, s_proj);
+  reindex();
   if (file && *file && openFile(file)) return true;
   char main[192];
   snprintf(main, sizeof main, "%s/main.c", dir);
@@ -274,9 +324,16 @@ static uint8_t *build(size_t *size) {
   if (!saveAll()) return nullptr;
   s_errPath[0] = 0;
   outClear();
-  char *files[32];
-  const int n = rt_list_sources(s_proj, files, 32);
+  char *files[32 + MAX_OTHER];
+  int n = rt_list_sources(s_proj, files, 32);
   if (!n) { setMsg(RED, "No .c files in %s", baseName(s_proj)); return nullptr; }
+  char *other[MAX_OTHER];   // and the .c files of other projects it includes
+  const int no = otherFiles(other);
+  for (int i = 0; i < no; i++) {
+    const size_t l = strlen(other[i]);
+    if (l > 2 && !strcmp(other[i] + l - 2, ".c")) files[n++] = other[i];
+    else free(other[i]);
+  }
   setMsg(YELLOW, "Building...");
   drawAll();
   outPrintf("Building %s: %d file%s\n", baseName(s_proj), n, n == 1 ? "" : "s");
@@ -288,6 +345,14 @@ static uint8_t *build(size_t *size) {
   cc_diag_hook = nullptr;
   for (int i = 0; i < n; i++) free(files[i]);
   hal_breadcrumb("ide");
+  if (const RtBuildMemory *m = rt_build_memory(); m->valid)
+    outPrintf("Memory: %u KB free, %u KB for the build (block %u KB)\n"
+              "  compiler peak %u KB, framebuffer %u of %u KB\n"
+              "  after: %u KB free (block %u KB)\n",
+              (unsigned)(m->heapBefore >> 10), (unsigned)(m->heapParked >> 10),
+              (unsigned)(m->largestParked >> 10), (unsigned)(m->compilerPeak >> 10),
+              (unsigned)(m->lentPeak >> 10), (unsigned)(m->lentSize >> 10),
+              (unsigned)(m->heapAfter >> 10), (unsigned)(m->largestAfter >> 10));
   if (!image) {
     const char *e = cc_error();
     outPrintf("%s\n", e);
@@ -304,6 +369,7 @@ static uint8_t *build(size_t *size) {
   outPrintf("OK: %u bytes, %lu ms\n", (unsigned)*size, (unsigned long)ms);
   hal_log("build %s: %u bytes, %lu ms", s_proj, (unsigned)*size, (unsigned long)ms);
   setMsg(GREEN, "Build OK: %u bytes, %lu ms", (unsigned)*size, (unsigned long)ms);
+  s_panel = true;   // with the memory status; any key hides it
   return image;
 }
 
@@ -355,14 +421,39 @@ static void run() {
   if (printed || bad) s_panel = true;
 }
 
-// Builds, then writes the firmware with the program in its export slot to /sd/apps/<project>.bin.
+// Creates dir and its missing parents.
+static bool mkdirs(const char *dir) {
+  char p[160];
+  snprintf(p, sizeof p, "%s", dir);
+  for (char *s = p + 1; *s; s++)
+    if (*s == '/') { *s = 0; mkdir(p, 0777); *s = '/'; }
+  return !mkdir(p, 0777) || isDir(p);
+}
+
+// Asks for the export folder (prefilled with the last one; empty means APPS_DIR), builds, then
+// writes the firmware with the program in its export slot to <folder>/<project>.bin (.uf2 on the
+// RP2350).
 static void exportApp() {
+  char dir[128];
+  snprintf(dir, sizeof dir, "%s", s_exportDir);
+  if (!ui_input("Export", "Export folder (empty: " APPS_DIR "):", dir, sizeof dir)) return;
+  size_t len = strlen(dir);
+  while (len > 1 && dir[len - 1] == '/') dir[--len] = 0;
+  if (!dir[0]) snprintf(dir, sizeof dir, "%s", APPS_DIR);
+  if (dir[0] != '/') { ui_message("Use a full path, like " APPS_DIR); return; }
+  if (!mkdirs(dir)) { ui_message("Can't create the folder (is the SD card in?)"); return; }
+  snprintf(s_exportDir, sizeof s_exportDir, "%s", dir);
+  cfgSave();
   size_t size;
   uint8_t *image = build(&size);
   if (!image) return;
   const char *name = baseName(s_proj);
   char path[200], err[160];
-  snprintf(path, sizeof path, "%s/%s.bin", APPS_DIR, name);
+#ifdef ARDUINO_ARCH_RP2040
+  snprintf(path, sizeof path, "%s/%s.uf2", dir, name);   // ex_export() names it so anyway
+#else
+  snprintf(path, sizeof path, "%s/%s.bin", dir, name);
+#endif
   setMsg(YELLOW, "Exporting %s...", path);
   drawAll();
   hal_breadcrumb("export %s", s_proj);
@@ -434,7 +525,24 @@ static bool copyDir(const char *from, const char *to) {
   return ok;
 }
 
-// "+ New from example": copies one of /sd/pico-dev/examples into /sd/pico-dev/projects and opens it.
+// Copies an example into /sd/pico-dev/projects under a name the user picks, then opens the copy.
+static void copyExample(const char *example) {
+  char name[33], src[160], dir[160];
+  snprintf(name, sizeof name, "%s", example);
+  snprintf(src, sizeof src, EXAMPLES_DIR "/%s", example);
+  mkdir(ROOT_DIR, 0777);
+  mkdir(PROJECTS_DIR, 0777);
+  for (;;) {
+    if (!ui_input("New from example", "Copy the example as project:", name, sizeof name) || !name[0]) return;
+    snprintf(dir, sizeof dir, PROJECTS_DIR "/%s", name);
+    if (!isDir(dir)) break;
+    ui_message("That project already exists: pick another name.");
+  }
+  if (!copyDir(src, dir)) { ui_message("Can't copy the example (is the SD card in?)"); return; }
+  if (closeProject()) { openProject(dir, nullptr); cfgSave(); }
+}
+
+// "+ New from example": picks an example to copy (the open one, if an example is open).
 static void newFromExample() {
   static char names[MAX_ITEMS][48];
   static const char *items[MAX_ITEMS];
@@ -453,25 +561,38 @@ static void newFromExample() {
       char t[48];
       memcpy(t, names[j], 48); memcpy(names[j], names[j - 1], 48); memcpy(names[j - 1], t, 48);
     }
-  for (int i = 0; i < n; i++) items[i] = names[i];
-  const int i = ui_list("Examples", items, n, &sel, "Enter: copy into a new project  Esc: back", nullptr);
-  if (i < 0) return;
-  char name[33], src[160], dir[160];
-  snprintf(name, sizeof name, "%s", names[i]);
-  snprintf(src, sizeof src, EXAMPLES_DIR "/%s", names[i]);
-  mkdir(ROOT_DIR, 0777);
-  mkdir(PROJECTS_DIR, 0777);
-  for (;;) {
-    if (!ui_input("New from example", "Project name:", name, sizeof name) || !name[0]) return;
-    snprintf(dir, sizeof dir, PROJECTS_DIR "/%s", name);
-    if (!isDir(dir)) break;
-    ui_message("That project already exists: pick another name.");
+  for (int i = 0; i < n; i++) {
+    items[i] = names[i];
+    if (isExample() && !strcmp(names[i], baseName(s_proj))) sel = i;
   }
-  if (!copyDir(src, dir)) { ui_message("Can't copy the example (is the SD card in?)"); return; }
-  if (closeProject()) { openProject(dir, nullptr); cfgSave(); }
+  const int i = ui_list("New from example", items, n, &sel, "Enter: copy into a new project  Esc: back", nullptr);
+  if (i >= 0) copyExample(names[i]);
 }
 
-// The project list. Returns when a project is open or the user goes back to an open one.
+// The folders of dir, sorted by name, into paths and labels from n on. Returns the new n.
+static int listProjects(const char *dir, char (*paths)[128], char (*labels)[64], int n) {
+  const int first = n;
+  if (DIR *d = opendir(dir)) {
+    while (struct dirent *e = readdir(d)) {
+      if (n == MAX_ITEMS || e->d_name[0] == '.') continue;
+      snprintf(paths[n], 128, "%s/%s", dir, e->d_name);
+      if (!isDir(paths[n])) continue;
+      snprintf(labels[n], 64, "  %s", e->d_name);
+      n++;
+    }
+    closedir(d);
+  }
+  for (int i = first + 1; i < n; i++)
+    for (int j = i; j > first && strcasecmp(labels[j - 1], labels[j]) > 0; j--) {
+      char t[128];
+      memcpy(t, paths[j], 128); memcpy(paths[j], paths[j - 1], 128); memcpy(paths[j - 1], t, 128);
+      memcpy(t, labels[j], 64); memcpy(labels[j], labels[j - 1], 64); memcpy(labels[j - 1], t, 64);
+    }
+  return n;
+}
+
+// The project list: "My files" (the projects in /sd/pico-dev/projects), then the examples, which
+// open read-only. Returns when a project is open or the user goes back to an open one.
 static void pickProject() {
   static char paths[MAX_ITEMS][128];
   static char labels[MAX_ITEMS][64];
@@ -479,33 +600,25 @@ static void pickProject() {
   for (;;) {
     int n = 0, sel = 0;
     snprintf(labels[n], sizeof labels[n], "+ New project");
-    paths[n][0] = 0;
-    n++;
+    paths[n++][0] = 0;
     snprintf(labels[n], sizeof labels[n], "+ New from example");
-    paths[n][0] = 0;
-    n++;
-    if (DIR *d = opendir(PROJECTS_DIR)) {
-      const int first = n;
-      while (struct dirent *e = readdir(d)) {
-        if (n == MAX_ITEMS || e->d_name[0] == '.') continue;
-        snprintf(paths[n], sizeof paths[n], PROJECTS_DIR "/%s", e->d_name);
-        if (!isDir(paths[n])) continue;
-        snprintf(labels[n], sizeof labels[n], "%s", e->d_name);
-        n++;
-      }
-      closedir(d);
-      // sort the projects by name (labels and paths together)
-      for (int i = first + 1; i < n; i++)
-        for (int j = i; j > first && strcasecmp(labels[j - 1], labels[j]) > 0; j--) {
-          char t[128];
-          memcpy(t, paths[j], 128); memcpy(paths[j], paths[j - 1], 128); memcpy(paths[j - 1], t, 128);
-          memcpy(t, labels[j], 64); memcpy(labels[j], labels[j - 1], 64); memcpy(labels[j - 1], t, 64);
-        }
+    paths[n++][0] = 0;
+    snprintf(labels[n], sizeof labels[n], "-- My files --");
+    paths[n++][0] = 0;
+    const int mine = n;
+    n = listProjects(PROJECTS_DIR, paths, labels, n);
+    if (n < MAX_ITEMS - 1) {
+      snprintf(labels[n], sizeof labels[n], "-- Examples --");
+      paths[n++][0] = 0;
+      const int examples = n;
+      n = listProjects(EXAMPLES_DIR, paths, labels, n);
+      if (n == examples) n--;   // no examples: no heading either
     }
     for (int i = 0; i < n; i++) {
       items[i] = labels[i];
       if (s_proj[0] && !strcmp(paths[i], s_proj)) sel = i;
     }
+    if (!sel && n > mine) sel = mine;   // the first of my projects
     int key = 0;
     const int i = ui_list("Projects", items, n, &sel, "Enter: open  F9: SDK demo  F10: loader  Esc: back", &key);
     if (i == -1) { if (s_ndocs) return; continue; }
@@ -519,6 +632,7 @@ static void pickProject() {
       if (s_ndocs) return;
       continue;
     }
+    if (!paths[i][0]) continue;   // a heading
     if (!strcmp(paths[i], s_proj)) return;
     char dir[160];
     snprintf(dir, sizeof dir, "%s", paths[i]);
@@ -542,7 +656,7 @@ static void newFile() {
   if (!f) { ui_message("Can't create the file."); return; }
   fputs(header ? "#pragma once\n\n" : "#include <picocalc.h>\n\n", f);
   fclose(f);
-  ac_project(INCLUDE_DIR, s_proj);
+  reindex();
   openFile(path);
 }
 
@@ -554,10 +668,209 @@ static void deleteFile(const char *name) {
   const int di = findDoc(path);
   if (di >= 0) closeDoc(di);
   if (remove(path)) ui_message("Can't delete the file.");
-  ac_project(INCLUDE_DIR, s_proj);
+  reindex();
 }
 
-// Esc in the editor: the project's files.
+// "#include <name>" or "#include "name"" in s[0, len): the name goes into out, *quoted says which.
+// False if it isn't one.
+static bool includeName(const char *s, int len, char *out, int size, bool *quoted) {
+  int i = 0;
+  while (i < len && (s[i] == ' ' || s[i] == '\t')) i++;
+  if (i == len || s[i] != '#') return false;
+  for (i++; i < len && (s[i] == ' ' || s[i] == '\t'); i++) {}
+  if (len - i < 7 || strncmp(s + i, "include", 7)) return false;
+  for (i += 7; i < len && (s[i] == ' ' || s[i] == '\t'); i++) {}
+  if (i == len || (s[i] != '<' && s[i] != '"')) return false;
+  const char close = s[i] == '<' ? '>' : '"';
+  *quoted = close == '"';
+  const int a = ++i;
+  while (i < len && s[i] != close) i++;
+  if (i == len || i == a || i - a >= size) return false;
+  memcpy(out, s + a, i - a);
+  out[i - a] = 0;
+  return true;
+}
+
+// Calls fn(arg, line, len) for each line of a file: an open one's text as edited, else as saved.
+static void eachLine(const char *path, void (*fn)(void *, const char *, int), void *arg) {
+  const int di = findDoc(path);
+  if (di >= 0) {
+    const Doc *d = s_docs[di];
+    for (int y = 0; y < d->n; y++) fn(arg, d->ln[y].s, d->ln[y].len);
+  } else if (FILE *f = fopen(path, "r")) {
+    char line[256];
+    while (fgets(line, sizeof line, f)) fn(arg, line, (int)strcspn(line, "\r\n"));
+    fclose(f);
+  }
+}
+
+// The project's .c/.h files, full paths, malloc'ed.
+static int projectSources(char **out, int max) {
+  int n = 0;
+  if (DIR *dp = opendir(s_proj)) {
+    while (struct dirent *e = readdir(dp)) {
+      const size_t l = strlen(e->d_name);
+      if (l < 3 || e->d_name[l - 2] != '.' || (e->d_name[l - 1] != 'c' && e->d_name[l - 1] != 'h') || n == max) continue;
+      char p[256];
+      snprintf(p, sizeof p, "%s/%s", s_proj, e->d_name);
+      out[n++] = strdup(p);
+    }
+    closedir(dp);
+  }
+  return n;
+}
+
+struct PathList { char **v; int n, max; const char *file; };
+
+static void addPath(PathList *l, const char *path) {
+  for (int i = 0; i < l->n; i++)
+    if (!strcmp(l->v[i], path)) return;
+  if (l->n < l->max) l->v[l->n++] = strdup(path);
+}
+
+// Another project's header that `#include` line s[0, len) of l->file brings in: quoted, found
+// next to the file (as the compiler looks, so "../other/x.h"), outside this project and the
+// include folder. Its .c (other/x.c), which builds with the project, comes too.
+static void otherInclude(void *arg, const char *s, int len) {
+  PathList *l = (PathList *)arg;
+  char name[96], p[192];
+  bool quoted;
+  if (!includeName(s, len, name, sizeof name, &quoted) || !quoted || name[0] == '/') return;
+  const char *slash = strrchr(l->file, '/');
+  snprintf(p, sizeof p, "%.*s/%s", slash ? (int)(slash - l->file) : 0, l->file, name);
+  cc_normpath(p);
+  struct stat st;
+  if (inProject(p) || !strncmp(p, INCLUDE_DIR "/", sizeof INCLUDE_DIR) || stat(p, &st) || S_ISDIR(st.st_mode)) return;
+  addPath(l, p);
+  const size_t n = strlen(p);
+  if (n > 2 && !strcmp(p + n - 2, ".h")) {
+    p[n - 1] = 'c';
+    if (!stat(p, &st)) addPath(l, p);
+  }
+}
+
+// The other projects' files this one uses: the headers it includes as "../other/x.h", the .c
+// next to each, and what those include in turn. Full paths, malloc'ed.
+static int otherFiles(char **out) {
+  PathList l = {out, 0, MAX_OTHER, nullptr};
+  if (!s_proj[0]) return 0;
+  char *files[MAX_ITEMS];
+  const int nf = projectSources(files, MAX_ITEMS);
+  for (int i = 0; i < nf; i++) {
+    l.file = files[i];
+    eachLine(files[i], otherInclude, &l);
+    free(files[i]);
+  }
+  for (int i = 0; i < l.n; i++) {   // l grows while it is read
+    l.file = l.v[i];
+    eachLine(l.v[i], otherInclude, &l);
+  }
+  return l.n;
+}
+
+// The project's names for completion and F9, with the other projects' files it uses.
+static void reindex() {
+  ac_project(INCLUDE_DIR, LIB_DIR, s_proj);
+  char *other[MAX_OTHER];
+  const int n = otherFiles(other);
+  ac_extra(other, n);
+  for (int i = 0; i < n; i++) free(other[i]);
+}
+
+static void addRef(char **refs, int *n, const char *path) {
+  for (int i = 0; i < *n; i++)
+    if (!strcmp(refs[i], path)) return;
+  if (*n < MAX_REFS) refs[(*n)++] = strdup(path);
+}
+
+struct RefList { char **refs; int *n; };
+
+// An #include of a project file: the header it names, if it is in the include folder, and its
+// library's sources (LIB_DIR/<name without .h>/).
+static void addInclude(void *arg, const char *s, int len) {
+  char **refs = ((RefList *)arg)->refs;
+  int *n = ((RefList *)arg)->n;
+  char name[96], path[192];
+  struct stat st;
+  bool quoted;
+  if (!includeName(s, len, name, sizeof name, &quoted)) return;
+  snprintf(path, sizeof path, "%s/%s", s_proj, name);
+  if (!stat(path, &st)) return;   // the project's own
+  snprintf(path, sizeof path, INCLUDE_DIR "/%s", name);
+  if (stat(path, &st) || S_ISDIR(st.st_mode)) return;
+  addRef(refs, n, path);
+  const size_t l = strlen(name);
+  if (l > 2 && !strcmp(name + l - 2, ".h")) name[l - 2] = 0;
+  snprintf(path, sizeof path, LIB_DIR "/%s", name);
+  if (DIR *dp = opendir(path)) {
+    while (struct dirent *e = readdir(dp)) {
+      const size_t m = strlen(e->d_name);
+      if (e->d_name[0] == '.' || !((m > 2 && !strcmp(e->d_name + m - 2, ".c")) || (m > 4 && !strcmp(e->d_name + m - 4, ".cpp"))))
+        continue;
+      char src[256];
+      snprintf(src, sizeof src, "%s/%s", path, e->d_name);
+      addRef(refs, n, src);
+    }
+    closedir(dp);
+  }
+}
+
+// The order of the references: a library source (LIB_DIR/x/file.c) right after its header
+// (INCLUDE_DIR/x.h), so it sorts as "INCLUDE_DIR/x.h" + '\1' + "file.c"; another project's x.c
+// right after its x.h the same way.
+static void refKey(const char *p, char *key, int size) {
+  if (!strncmp(p, LIB_DIR "/", sizeof LIB_DIR)) {
+    const char *lib = p + sizeof LIB_DIR, *slash = strchr(lib, '/');
+    if (slash) {
+      snprintf(key, size, INCLUDE_DIR "/%.*s.h\1%s", (int)(slash - lib), lib, slash + 1);
+      return;
+    }
+  }
+  const size_t l = strlen(p);
+  if (l > 2 && !strcmp(p + l - 2, ".c")) snprintf(key, size, "%.*sh\1c", (int)(l - 1), p);
+  else snprintf(key, size, "%s", p);
+}
+
+// Another project's file as the project names it: "../other/x.h". Null if it isn't one.
+static const char *otherName(const char *p, char *buf, int size) {
+  const char *slash = strrchr(s_proj, '/');
+  if (!slash || strncmp(p, s_proj, slash + 1 - s_proj)) return nullptr;
+  snprintf(buf, size, "../%s", p + (slash + 1 - s_proj));
+  return buf;
+}
+
+static int cmpRef(const void *a, const void *b) {
+  char ka[256], kb[256];
+  refKey(*(char *const *)a, ka, sizeof ka);
+  refKey(*(char *const *)b, kb, sizeof kb);
+  return strcasecmp(ka, kb);
+}
+
+// The files outside the project it refers to: the headers its .c/.h files include (as edited)
+// with their library sources, the other projects' files it uses, and the other files open in the
+// editor (F9 went there). Full paths, malloc'ed, sorted.
+static int listRefs(char **refs) {
+  int n = 0;
+  RefList rl = {refs, &n};
+  char *files[MAX_ITEMS];
+  const int nf = projectSources(files, MAX_ITEMS);
+  for (int i = 0; i < nf; i++) {
+    eachLine(files[i], addInclude, &rl);
+    free(files[i]);
+  }
+  char *other[MAX_OTHER];
+  const int no = otherFiles(other);
+  for (int i = 0; i < no; i++) {
+    addRef(refs, &n, other[i]);
+    free(other[i]);
+  }
+  for (int i = 0; i < s_ndocs; i++)
+    if (!inProject(s_docs[i]->path)) addRef(refs, &n, s_docs[i]->path);
+  qsort(refs, n, sizeof *refs, cmpRef);
+  return n;
+}
+
+// Esc in the editor: the project's files, then the files it refers to.
 static void pickFile() {
   static char names[MAX_ITEMS][64];
   static char labels[MAX_ITEMS][72];
@@ -589,26 +902,57 @@ static void pickFile() {
       if (cur() && !strcmp(cur()->path, p)) sel = n;
       free(list[i]);
     }
+    const int filesEnd = n;   // then "External references files" and the files it lists
+    char *refs[MAX_REFS];
+    const int nr = listRefs(refs);
+    int nrShown = 0;
+    if (nr && n + 1 < MAX_ITEMS) {
+      snprintf(labels[n++], sizeof labels[0], "-- External references files --");
+      for (; nrShown < nr && n < MAX_ITEMS; nrShown++, n++) {
+        const int di = findDoc(refs[nrShown]);
+        const char *r = refs[nrShown];
+        const bool inc = !strncmp(r, INCLUDE_DIR "/", sizeof INCLUDE_DIR);
+        const bool lib = !strncmp(r, LIB_DIR "/", sizeof LIB_DIR);   // shown as <x>/file.c
+        char buf[160];
+        const char *other = inc || lib ? nullptr : otherName(r, buf, sizeof buf);   // "../other/x.h"
+        const size_t rl = strlen(r);
+        const bool src = lib || (other && rl > 2 && !strcmp(r + rl - 2, ".c"));      // under its header
+        snprintf(labels[n], sizeof labels[n], inc ? "%s <%s>" : src ? "%s   %s" : "%s %s",
+                 di >= 0 && s_docs[di]->modified ? "*" : " ",
+                 inc ? r + sizeof INCLUDE_DIR : lib ? r + sizeof LIB_DIR : other ? other : r);
+        if (cur() && !strcmp(cur()->path, r)) sel = n;
+      }
+    }
     for (int i = 0; i < n; i++) items[i] = labels[i];
     char title[80];
     snprintf(title, sizeof title, "Files - %s", baseName(s_proj));
     int key = 0;
     const bool unsaved = anyModified();   // F3 shown only when there is something to save
     const int i = ui_list(title, items, n, &sel,
-                          unsaved ? "Enter: open  Del: delete  F3: save all  Esc: editor"
-                                  : "Enter: open  Del: delete  Esc: editor", &key);
+                          isExample() ? "Enter: open  Esc: editor  (example: read-only)"
+                          : unsaved   ? "Enter: open  Del: delete  F3: save all  Esc: editor"
+                                      : "Enter: open  Del: delete  Esc: editor", &key);
+    char ref[192] = "";
+    if (i > filesEnd) snprintf(ref, sizeof ref, "%s", refs[i - filesEnd - 1]);
+    for (int r = 0; r < nr; r++) free(refs[r]);
     if (i == -1) return;
     if (i == 0) { pickProject(); return; }
-    if (i == 1) { newFile(); return; }
+    if (i == 1) {
+      if (isExample()) { setMsg(YELLOW, "Examples are read-only: \"+ New from example\" copies one"); return; }
+      newFile();
+      return;
+    }
     if (i == -2) {
-      if (key == KEY_DEL && sel >= 2) deleteFile(names[sel]);
+      if (key == KEY_DEL && sel >= 2 && sel < filesEnd && !isExample()) deleteFile(names[sel]);   // not a reference
       else if (key == KEY_F3 && unsaved) {
         if (saveAll()) { setMsg(GREEN, "Saved"); cfgSave(); }
         else ui_message(s_msg);
       }
       continue;
     }
-    openFile(names[i]);
+    if (i == filesEnd) continue;   // the "External references files" line
+    Doc *from = cur();
+    if (openFile(ref[0] ? ref : names[i]) && ref[0] && from && from != cur()) pushBack(from);   // Esc comes back
     cfgSave();
     return;
   }
@@ -621,12 +965,42 @@ static const char kHelp[] =
     "F2   mark mode on/off (select with the arrows)\n"
     "F3   build (saves all files first)\n"
     "F4   build and run; Break stops the program\n"
-    "F5   export /sd/apps/<project>.bin: a firmware\n"
-    "     that runs the program, for PicoMultiLoader\n"
+    "F5   export <folder>/<project>.bin (.uf2 on the\n"
+    "     Pico 2): a firmware that runs the program,\n"
+    "     for PicoMultiLoader. Asks for the folder;\n"
+    "     the default is /sd/pico-dev/apps\n"
     "F6   full build/program output (closing it also\n"
     "     hides the output panel)\n"
+    "F7   output panel on/off: the last lines of the\n"
+    "     build (memory use, errors) and of the\n"
+    "     program's output. F3/F4/F5 show it, any\n"
+    "     other key hides it\n"
+    "F8   back to the last edit (any file)\n"
+    "F9   go to the declaration of the name at the\n"
+    "     cursor: a local, a parameter, a function,\n"
+    "     macro, type, global or struct member, in the\n"
+    "     project or the headers\n"
+    "F10  back to PicoMultiLoader (Shift-F5 too, on\n"
+    "     any screen)\n"
     "Esc  clear the selection, else the files of the\n"
-    "     project (Esc there: back to the editor)\n"
+    "     project (Esc there: back to the editor).\n"
+    "     Under External references files: the\n"
+    "     headers the project includes and other\n"
+    "     files F9 opened\n"
+    "\n"
+    "Using another project's code: #include\n"
+    "\"../other/x.h\" in a file. x.h then shows\n"
+    "under External references files with x.c (if\n"
+    "there is one), F9 and Ctrl-Space know their\n"
+    "names, and x.c is built with the project.\n"
+    "\n"
+    "Reference files (headers, files outside the\n"
+    "project; REF in the status bar) are read-only:\n"
+    "F9   go to a declaration, deeper\n"
+    "Esc  back to where you came from; with\n"
+    "     nothing to go back to, the files\n"
+    "F2, Ctrl-A, Ctrl-C, Ctrl-F, Ctrl-G as usual.\n"
+    "F3/F4/F5 work from the project's own files.\n"
     "\n"
     "Editing\n"
     "Ctrl-S  save all     Ctrl-G  go to line\n"
@@ -672,11 +1046,11 @@ static const char kHelp[] =
     "If a program crashes, the IDE reopens at the\n"
     "line where it crashed.\n"
     "\n"
-    "In the project list: \"+ New from example\"\n"
-    "copies an example, F9 SDK demo.\n"
-    "\n"
-    "F10 or Shift-F5, on any screen: back to\n"
-    "PicoMultiLoader.\n";
+    "In the project list: My files are your\n"
+    "projects. Examples open read-only (build and\n"
+    "run them); \"+ New from example\" copies one\n"
+    "into a new project to change. F9 there: SDK\n"
+    "demo.\n";
 
 // Shows a text file (a header). Large ones are cut.
 static void viewFile(const char *path) {
@@ -764,7 +1138,8 @@ static void drawAll() {
   Doc *d = cur();
   const int rows = editRows();
   char title[96];
-  snprintf(title, sizeof title, "%s / %s%s", baseName(s_proj), d ? baseName(d->path) : "", d && d->modified ? " *" : "");
+  snprintf(title, sizeof title, "%s / %s%s", baseName(s_proj), d ? baseName(d->path) : "",
+           d && d->readOnly ? " (read-only)" : d && d->modified ? " *" : "");
   gfx_font(FONT_6X10);
   ui_title(title, s_battery);
   if (d) ed_draw(d, UI_BAR_H, rows, !strcmp(s_errPath, d->path) ? s_errLine : -1);
@@ -780,6 +1155,9 @@ static void drawAll() {
   if (s_msg[0]) ui_status(s_msg, pos, s_msgColor);
   else if (ac_active()) ui_status(hint ? hint : "Tab/Enter/Space: insert  Esc: close", hint ? hintPos : pos, HINT_COLOR);
   else if (d && d->marking) ui_status("MARK: move to select  F2 done  Esc cancel", pos, ORANGE);
+  else if (d && d->readOnly && ed_has_sel(d)) ui_status("SEL: ^C copy  Esc clear", pos, REF_COLOR);
+  else if (d && isRef(d)) ui_status("REF  F9 go to decl  Esc back  ^F find", pos, REF_COLOR);
+  else if (d && d->readOnly) ui_status("EXAMPLE F1 help F3 build F4 run Esc files", pos, REF_COLOR);
   else if (d && ed_has_sel(d)) ui_status("SEL: ^C copy ^X cut ^V paste  Esc clear", pos, UI_TEXT);
   else ui_status("F1 help F2 mark F3 build F4 run Esc files", pos, UI_DIM);
   gfx_flush();
@@ -830,6 +1208,7 @@ static void selectionText(Doc *d, char *buf, int size) {
 // about each one.
 static void replace(Doc *d, int rows) {
   if (!d) return;
+  if (d->readOnly) { readOnlyMsg(d); return; }
   selectionText(d, s_find, sizeof s_find);
   if (!ui_input("Replace", "Text to find:", s_find, sizeof s_find) || !s_find[0]) return;
   if (!ui_input("Replace", "Replace with:", s_repl, sizeof s_repl)) return;
@@ -859,10 +1238,97 @@ static void replace(Doc *d, int rows) {
   setMsg(count ? GREEN : YELLOW, "%d replaced", count);
 }
 
+static bool wordChar(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+// The column of the whole word w in line y nearest to col, or col if it isn't there (columns read
+// from a file on the card don't count the tabs the editor expands).
+static int nearestWord(const Doc *d, int y, int col, const char *w) {
+  const DocLine *l = &d->ln[y];
+  const int n = (int)strlen(w);
+  int best = col;
+  for (int x = 0; x + n <= l->len; x++)
+    if (!memcmp(l->s + x, w, n) && (x == 0 || !wordChar(l->s[x - 1])) && (x + n == l->len || !wordChar(l->s[x + n])) &&
+        (best == col || abs(x - col) < abs(best - col)))
+      best = x;
+  return best;
+}
+
+// F9: to the declaration of the name at the cursor, in the project or a header; Esc comes back
+// from a header.
+static void gotoDecl(Doc *d, int rows) {
+  if (!d) return;
+  char name[64], path[192];
+  int line, col;
+  if (!ac_find_decl(s_docs, s_ndocs, d, name, sizeof name, path, sizeof path, &line, &col)) {
+    if (name[0]) setMsg(YELLOW, "No declaration of %s found", name);
+    else setMsg(YELLOW, "F9: put the cursor on a name");
+    return;
+  }
+  if (!openFile(path)) return;   // d stays open: openFile drops only a file that isn't shown
+  pushBack(d);
+  Doc *t = cur();
+  if (line >= t->n) line = t->n - 1;
+  ed_goto(t, line, nearestWord(t, line, col, name), rows);
+  setMsg(GREEN, "%s: %s line %d  %s", name, baseName(t->path), line + 1, t->readOnly ? "Esc back" : "F8: last edit");
+}
+
+static void goBack(int rows) {
+  if (!s_nback) { setMsg(UI_DIM, "Nothing to go back to (F9 goes to a declaration)"); return; }
+  const Place &p = s_back[--s_nback];
+  if (!openFile(p.path)) return;
+  Doc *t = cur();
+  ed_goto(t, p.y < t->n ? p.y : t->n - 1, p.x, rows);
+}
+
+// F8: to where the last edit left the cursor.
+static void goLastEdit(int rows) {
+  if (!s_lastEdit.path[0]) { setMsg(UI_DIM, "No edits yet"); return; }
+  if (!openFile(s_lastEdit.path)) return;
+  Doc *t = cur();
+  ed_goto(t, s_lastEdit.y < t->n ? s_lastEdit.y : t->n - 1, s_lastEdit.x, rows);
+}
+
+// Changes with every edit (typing may only grow the last undo record).
+static uint64_t editStamp(const Doc *d) {
+  if (!d) return 0;
+  const DocUndo *r = d->nu ? &d->u[d->nu - 1] : nullptr;
+  return (uint64_t)d->nu << 48 ^ (uint64_t)d->nt << 32 ^ (uint64_t)d->n << 16 ^
+         (r ? (uint32_t)(r->n * 31 + r->y * 7 + r->x) : 0);
+}
+
+static void doCommand(int k);
+
 static void command(int k) {
   Doc *d = cur();
+  const uint64_t stamp = editStamp(d);
+  doCommand(k);
+  if (d && cur() == d && editStamp(d) != stamp) {
+    snprintf(s_lastEdit.path, sizeof s_lastEdit.path, "%s", d->path);
+    s_lastEdit.y = d->cy;
+    s_lastEdit.x = d->cx;
+  }
+}
+
+static void doCommand(int k) {
+  Doc *d = cur();
+  const bool panel = s_panel;
+  s_panel = false;   // any key hides the output panel (F3-F5 and F7 show it); the key still counts
   const int rows = editRows();
   if (d && ac_key(d, k, rows)) return;   // the completion list takes it
+  // F6-F10 are Shift+F1-F5 on this keyboard, so they come with Shift
+  if ((k & 0xFF) >= KEY_F6 && (k & 0xFF) <= KEY_F10 && !(k & (UI_CTRL | UI_ALT))) k &= ~UI_SHIFT;
+  if (d && d->readOnly && isRef(d)) {   // a reference file: viewing keys only
+    switch (k) {
+      case KEY_F3: case KEY_F4: case KEY_F5:
+        setMsg(YELLOW, "Reference file: Esc back to the project to build");
+        return;
+      case KEY_ESC:
+        if (d->marking || ed_has_sel(d)) ed_unselect(d);
+        else if (s_nback) goBack(rows);
+        else pickFile();
+        return;
+    }
+  }
   switch (k) {
     case KEY_F1: helpMenu(); break;
     case KEY_F2: if (d) ed_mark(d); break;
@@ -873,6 +1339,12 @@ static void command(int k) {
       ui_text_view("Output", s_outLen ? s_out : "(no output yet)");
       s_panel = false;
       break;
+    case KEY_F7:
+      if (!s_outLen) setMsg(UI_DIM, "No output yet (F3 builds)");
+      else s_panel = !panel;
+      break;
+    case KEY_F8: goLastEdit(rows); break;
+    case KEY_F9: gotoDecl(d, rows); break;
     case KEY_ESC:
       if (d && (d->marking || ed_has_sel(d))) ed_unselect(d);
       else pickFile();
@@ -895,10 +1367,12 @@ static void command(int k) {
       break;
     case 'r' | UI_CTRL: replace(d, rows); break;
     case ' ' | UI_CTRL:
-      if (d && !ac_open(s_docs, s_ndocs, d, rows)) setMsg(UI_DIM, "No names to complete");
+      if (d && d->readOnly) readOnlyMsg(d);
+      else if (d && !ac_open(s_docs, s_ndocs, d, rows)) setMsg(UI_DIM, "No names to complete");
       break;
     default:
       if (d && ed_key(d, k, rows)) ac_after_key(d, k);
+      else if (d && d->readOnly && !(k & UI_ALT) && (k & 0xFF) != KEY_ESC) readOnlyMsg(d);
       break;
   }
 }

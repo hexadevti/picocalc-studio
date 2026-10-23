@@ -5,430 +5,468 @@
     .balign 4
     .global rt_exports
 rt_exports:
+#ifdef __riscv_flen
+    .weak __addsf3
+    .weak __divsf3
+    .weak __eqsf2
+    .weak __fixsfsi
+    .weak __fixunssfsi
+    .weak __floatsisf
+    .weak __floatunsisf
+    .weak __lesf2
+    .weak __ltsf2
+    .weak __mulsf3
+    .weak __nesf2
+    .weak __subsf3
+#endif
     .word .Ls0, __adddf3
-    .word .Ls1, __ashldi3
-    .word .Ls2, __ashrdi3
-    .word .Ls3, __divdf3
-    .word .Ls4, __divdi3
-    .word .Ls5, __eqdf2
-    .word .Ls6, __errno
-    .word .Ls7, __extendsfdf2
-    .word .Ls8, __fixdfdi
-    .word .Ls9, __fixdfsi
-    .word .Ls10, __fixsfdi
-    .word .Ls11, __fixunsdfdi
-    .word .Ls12, __fixunsdfsi
-    .word .Ls13, __fixunssfdi
-    .word .Ls14, __floatdidf
-    .word .Ls15, __floatdisf
-    .word .Ls16, __floatsidf
-    .word .Ls17, __floatundidf
-    .word .Ls18, __floatundisf
-    .word .Ls19, __floatunsidf
-    .word .Ls20, __gedf2
-    .word .Ls21, __getreent
-    .word .Ls22, __gtdf2
-    .word .Ls23, __ledf2
-    .word .Ls24, __lshrdi3
-    .word .Ls25, __ltdf2
-    .word .Ls26, __moddi3
-    .word .Ls27, __muldf3
-    .word .Ls28, __muldi3
-    .word .Ls29, __nedf2
-    .word .Ls30, __negdf2
-    .word .Ls31, __subdf3
-    .word .Ls32, __truncdfsf2
-    .word .Ls33, __udivdi3
-    .word .Ls34, __umoddi3
-    .word .Ls35, __unorddf2
-    .word .Ls36, abort
-    .word .Ls37, abs
-    .word .Ls38, acos
-    .word .Ls39, asin
-    .word .Ls40, atan
-    .word .Ls41, atan2
-    .word .Ls42, atan2f
-    .word .Ls43, atof
-    .word .Ls44, atoi
-    .word .Ls45, atol
-    .word .Ls46, bsearch
-    .word .Ls47, calloc
-    .word .Ls48, ceil
-    .word .Ls49, ceilf
-    .word .Ls50, closedir
-    .word .Ls51, cos
-    .word .Ls52, cosf
-    .word .Ls53, cosh
-    .word .Ls54, exit
-    .word .Ls55, exp
-    .word .Ls56, expf
-    .word .Ls57, fabs
-    .word .Ls58, fabsf
-    .word .Ls59, fclose
-    .word .Ls60, feof
-    .word .Ls61, ferror
-    .word .Ls62, fflush
-    .word .Ls63, fgetc
-    .word .Ls64, fgets
-    .word .Ls65, floor
-    .word .Ls66, floorf
-    .word .Ls67, fmod
-    .word .Ls68, fmodf
-    .word .Ls69, fopen
-    .word .Ls70, fprintf
-    .word .Ls71, fputc
-    .word .Ls72, fputs
-    .word .Ls73, fread
-    .word .Ls74, free
-    .word .Ls75, fscanf
-    .word .Ls76, fseek
-    .word .Ls77, ftell
-    .word .Ls78, fwrite
-    .word .Ls79, getchar
-    .word .Ls80, gfx_blit
-    .word .Ls81, gfx_circle
-    .word .Ls82, gfx_clear
-    .word .Ls83, gfx_clip
-    .word .Ls84, gfx_fill_circle
-    .word .Ls85, gfx_fill_rect
-    .word .Ls86, gfx_fill_round_rect
-    .word .Ls87, gfx_fill_triangle
-    .word .Ls88, gfx_flush
-    .word .Ls89, gfx_flush_rect
-    .word .Ls90, gfx_font
-    .word .Ls91, gfx_font_h
-    .word .Ls92, gfx_font_w
-    .word .Ls93, gfx_framebuffer
-    .word .Ls94, gfx_get_pixel
-    .word .Ls95, gfx_hline
-    .word .Ls96, gfx_line
-    .word .Ls97, gfx_noclip
-    .word .Ls98, gfx_pixel
-    .word .Ls99, gfx_printf
-    .word .Ls100, gfx_rect
-    .word .Ls101, gfx_round_rect
-    .word .Ls102, gfx_scroll
-    .word .Ls103, gfx_text
-    .word .Ls104, gfx_text_bg
-    .word .Ls105, gfx_text_width
-    .word .Ls106, gfx_triangle
-    .word .Ls107, gfx_vline
-    .word .Ls108, hypot
-    .word .Ls109, isalnum
-    .word .Ls110, isalpha
-    .word .Ls111, isdigit
-    .word .Ls112, islower
-    .word .Ls113, isprint
-    .word .Ls114, ispunct
-    .word .Ls115, isspace
-    .word .Ls116, isupper
-    .word .Ls117, isxdigit
-    .word .Ls118, kbd_backlight
-    .word .Ls119, kbd_down
-    .word .Ls120, kbd_event
-    .word .Ls121, kbd_flush
-    .word .Ls122, kbd_get
-    .word .Ls123, kbd_mods
-    .word .Ls124, kbd_wait
-    .word .Ls125, labs
-    .word .Ls126, log
-    .word .Ls127, log10
-    .word .Ls128, log2
-    .word .Ls129, logf
-    .word .Ls130, longjmp
-    .word .Ls131, malloc
-    .word .Ls132, memchr
-    .word .Ls133, memcmp
-    .word .Ls134, memcpy
-    .word .Ls135, memmove
-    .word .Ls136, memset
-    .word .Ls137, mkdir
-    .word .Ls138, opendir
-    .word .Ls139, pow
-    .word .Ls140, powf
-    .word .Ls141, printf
-    .word .Ls142, putchar
-    .word .Ls143, puts
-    .word .Ls144, qsort
-    .word .Ls145, rand
-    .word .Ls146, readdir
-    .word .Ls147, realloc
-    .word .Ls148, remove
-    .word .Ls149, rename
-    .word .Ls150, rewind
-    .word .Ls151, round
-    .word .Ls152, roundf
-    .word .Ls153, setjmp
-    .word .Ls154, sin
-    .word .Ls155, sinf
-    .word .Ls156, sinh
-    .word .Ls157, snd_busy
-    .word .Ls158, snd_play
-    .word .Ls159, snd_stop
-    .word .Ls160, snd_tone
-    .word .Ls161, snd_volume
-    .word .Ls162, snprintf
-    .word .Ls163, sprintf
-    .word .Ls164, sqrt
-    .word .Ls165, sqrtf
-    .word .Ls166, srand
-    .word .Ls167, sscanf
-    .word .Ls168, stat
-    .word .Ls169, strcasecmp
-    .word .Ls170, strcat
-    .word .Ls171, strchr
-    .word .Ls172, strcmp
-    .word .Ls173, strcpy
-    .word .Ls174, strcspn
-    .word .Ls175, strdup
-    .word .Ls176, strlen
-    .word .Ls177, strncasecmp
-    .word .Ls178, strncat
-    .word .Ls179, strncmp
-    .word .Ls180, strncpy
-    .word .Ls181, strrchr
-    .word .Ls182, strspn
-    .word .Ls183, strstr
-    .word .Ls184, strtod
-    .word .Ls185, strtof
-    .word .Ls186, strtok
-    .word .Ls187, strtol
-    .word .Ls188, strtoul
-    .word .Ls189, sys_backlight
-    .word .Ls190, sys_battery
-    .word .Ls191, sys_delay
-    .word .Ls192, sys_exit
-    .word .Ls193, sys_exit_to_loader
-    .word .Ls194, sys_free_heap
-    .word .Ls195, sys_log
-    .word .Ls196, sys_micros
-    .word .Ls197, sys_millis
-    .word .Ls198, sys_random
-    .word .Ls199, sys_seed
-    .word .Ls200, sys_yield
-    .word .Ls201, tan
-    .word .Ls202, tanf
-    .word .Ls203, tanh
-    .word .Ls204, tolower
-    .word .Ls205, toupper
-    .word .Ls206, trunc
-    .word .Ls207, unlink
-    .word .Ls208, vprintf
-    .word .Ls209, vsnprintf
+    .word .Ls1, __addsf3
+    .word .Ls2, __ashldi3
+    .word .Ls3, __ashrdi3
+    .word .Ls4, __divdf3
+    .word .Ls5, __divdi3
+    .word .Ls6, __divsf3
+    .word .Ls7, __eqdf2
+    .word .Ls8, __eqsf2
+    .word .Ls9, __errno
+    .word .Ls10, __extendsfdf2
+    .word .Ls11, __fixdfdi
+    .word .Ls12, __fixdfsi
+    .word .Ls13, __fixsfdi
+    .word .Ls14, __fixsfsi
+    .word .Ls15, __fixunsdfdi
+    .word .Ls16, __fixunsdfsi
+    .word .Ls17, __fixunssfdi
+    .word .Ls18, __fixunssfsi
+    .word .Ls19, __floatdidf
+    .word .Ls20, __floatdisf
+    .word .Ls21, __floatsidf
+    .word .Ls22, __floatsisf
+    .word .Ls23, __floatundidf
+    .word .Ls24, __floatundisf
+    .word .Ls25, __floatunsidf
+    .word .Ls26, __floatunsisf
+    .word .Ls27, __gedf2
+    .word .Ls28, __getreent
+    .word .Ls29, __gtdf2
+    .word .Ls30, __ledf2
+    .word .Ls31, __lesf2
+    .word .Ls32, __lshrdi3
+    .word .Ls33, __ltdf2
+    .word .Ls34, __ltsf2
+    .word .Ls35, __moddi3
+    .word .Ls36, __muldf3
+    .word .Ls37, __muldi3
+    .word .Ls38, __mulsf3
+    .word .Ls39, __nedf2
+    .word .Ls40, __negdf2
+    .word .Ls41, __nesf2
+    .word .Ls42, __subdf3
+    .word .Ls43, __subsf3
+    .word .Ls44, __truncdfsf2
+    .word .Ls45, __udivdi3
+    .word .Ls46, __umoddi3
+    .word .Ls47, __unorddf2
+    .word .Ls48, abort
+    .word .Ls49, abs
+    .word .Ls50, acos
+    .word .Ls51, asin
+    .word .Ls52, atan
+    .word .Ls53, atan2
+    .word .Ls54, atan2f
+    .word .Ls55, atof
+    .word .Ls56, atoi
+    .word .Ls57, atol
+    .word .Ls58, bsearch
+    .word .Ls59, calloc
+    .word .Ls60, ceil
+    .word .Ls61, ceilf
+    .word .Ls62, closedir
+    .word .Ls63, cos
+    .word .Ls64, cosf
+    .word .Ls65, cosh
+    .word .Ls66, exit
+    .word .Ls67, exp
+    .word .Ls68, expf
+    .word .Ls69, fabs
+    .word .Ls70, fabsf
+    .word .Ls71, fclose
+    .word .Ls72, feof
+    .word .Ls73, ferror
+    .word .Ls74, fflush
+    .word .Ls75, fgetc
+    .word .Ls76, fgets
+    .word .Ls77, floor
+    .word .Ls78, floorf
+    .word .Ls79, fmod
+    .word .Ls80, fmodf
+    .word .Ls81, fopen
+    .word .Ls82, fprintf
+    .word .Ls83, fputc
+    .word .Ls84, fputs
+    .word .Ls85, fread
+    .word .Ls86, free
+    .word .Ls87, fscanf
+    .word .Ls88, fseek
+    .word .Ls89, ftell
+    .word .Ls90, fwrite
+    .word .Ls91, getchar
+    .word .Ls92, gfx_blit
+    .word .Ls93, gfx_circle
+    .word .Ls94, gfx_clear
+    .word .Ls95, gfx_clip
+    .word .Ls96, gfx_fill_circle
+    .word .Ls97, gfx_fill_rect
+    .word .Ls98, gfx_fill_round_rect
+    .word .Ls99, gfx_fill_triangle
+    .word .Ls100, gfx_flush
+    .word .Ls101, gfx_flush_rect
+    .word .Ls102, gfx_font
+    .word .Ls103, gfx_font_h
+    .word .Ls104, gfx_font_w
+    .word .Ls105, gfx_framebuffer
+    .word .Ls106, gfx_get_pixel
+    .word .Ls107, gfx_hline
+    .word .Ls108, gfx_line
+    .word .Ls109, gfx_noclip
+    .word .Ls110, gfx_pixel
+    .word .Ls111, gfx_printf
+    .word .Ls112, gfx_rect
+    .word .Ls113, gfx_round_rect
+    .word .Ls114, gfx_scroll
+    .word .Ls115, gfx_text
+    .word .Ls116, gfx_text_bg
+    .word .Ls117, gfx_text_width
+    .word .Ls118, gfx_triangle
+    .word .Ls119, gfx_vline
+    .word .Ls120, hypot
+    .word .Ls121, isalnum
+    .word .Ls122, isalpha
+    .word .Ls123, isdigit
+    .word .Ls124, islower
+    .word .Ls125, isprint
+    .word .Ls126, ispunct
+    .word .Ls127, isspace
+    .word .Ls128, isupper
+    .word .Ls129, isxdigit
+    .word .Ls130, kbd_backlight
+    .word .Ls131, kbd_down
+    .word .Ls132, kbd_event
+    .word .Ls133, kbd_flush
+    .word .Ls134, kbd_get
+    .word .Ls135, kbd_mods
+    .word .Ls136, kbd_wait
+    .word .Ls137, labs
+    .word .Ls138, log
+    .word .Ls139, log10
+    .word .Ls140, log2
+    .word .Ls141, logf
+    .word .Ls142, longjmp
+    .word .Ls143, malloc
+    .word .Ls144, memchr
+    .word .Ls145, memcmp
+    .word .Ls146, memcpy
+    .word .Ls147, memmove
+    .word .Ls148, memset
+    .word .Ls149, mkdir
+    .word .Ls150, opendir
+    .word .Ls151, pow
+    .word .Ls152, powf
+    .word .Ls153, printf
+    .word .Ls154, putchar
+    .word .Ls155, puts
+    .word .Ls156, qsort
+    .word .Ls157, rand
+    .word .Ls158, readdir
+    .word .Ls159, realloc
+    .word .Ls160, remove
+    .word .Ls161, rename
+    .word .Ls162, rewind
+    .word .Ls163, round
+    .word .Ls164, roundf
+    .word .Ls165, setjmp
+    .word .Ls166, sin
+    .word .Ls167, sinf
+    .word .Ls168, sinh
+    .word .Ls169, snd_busy
+    .word .Ls170, snd_play
+    .word .Ls171, snd_stop
+    .word .Ls172, snd_tone
+    .word .Ls173, snd_volume
+    .word .Ls174, snprintf
+    .word .Ls175, sprintf
+    .word .Ls176, sqrt
+    .word .Ls177, sqrtf
+    .word .Ls178, srand
+    .word .Ls179, sscanf
+    .word .Ls180, stat
+    .word .Ls181, strcasecmp
+    .word .Ls182, strcat
+    .word .Ls183, strchr
+    .word .Ls184, strcmp
+    .word .Ls185, strcpy
+    .word .Ls186, strcspn
+    .word .Ls187, strdup
+    .word .Ls188, strlen
+    .word .Ls189, strncasecmp
+    .word .Ls190, strncat
+    .word .Ls191, strncmp
+    .word .Ls192, strncpy
+    .word .Ls193, strrchr
+    .word .Ls194, strspn
+    .word .Ls195, strstr
+    .word .Ls196, strtod
+    .word .Ls197, strtof
+    .word .Ls198, strtok
+    .word .Ls199, strtol
+    .word .Ls200, strtoul
+    .word .Ls201, sys_backlight
+    .word .Ls202, sys_battery
+    .word .Ls203, sys_delay
+    .word .Ls204, sys_exit
+    .word .Ls205, sys_exit_to_loader
+    .word .Ls206, sys_free_heap
+    .word .Ls207, sys_log
+    .word .Ls208, sys_micros
+    .word .Ls209, sys_millis
+    .word .Ls210, sys_random
+    .word .Ls211, sys_seed
+    .word .Ls212, sys_yield
+    .word .Ls213, tan
+    .word .Ls214, tanf
+    .word .Ls215, tanh
+    .word .Ls216, tolower
+    .word .Ls217, toupper
+    .word .Ls218, trunc
+    .word .Ls219, unlink
+    .word .Ls220, vprintf
+    .word .Ls221, vsnprintf
 
     .global rt_exports_count
     .balign 4
 rt_exports_count:
-    .word 210
+    .word 222
 
     .section .rodata.rt_export_names, "aMS", @progbits, 1
 .Ls0: .asciz "__adddf3"
-.Ls1: .asciz "__ashldi3"
-.Ls2: .asciz "__ashrdi3"
-.Ls3: .asciz "__divdf3"
-.Ls4: .asciz "__divdi3"
-.Ls5: .asciz "__eqdf2"
-.Ls6: .asciz "__errno"
-.Ls7: .asciz "__extendsfdf2"
-.Ls8: .asciz "__fixdfdi"
-.Ls9: .asciz "__fixdfsi"
-.Ls10: .asciz "__fixsfdi"
-.Ls11: .asciz "__fixunsdfdi"
-.Ls12: .asciz "__fixunsdfsi"
-.Ls13: .asciz "__fixunssfdi"
-.Ls14: .asciz "__floatdidf"
-.Ls15: .asciz "__floatdisf"
-.Ls16: .asciz "__floatsidf"
-.Ls17: .asciz "__floatundidf"
-.Ls18: .asciz "__floatundisf"
-.Ls19: .asciz "__floatunsidf"
-.Ls20: .asciz "__gedf2"
-.Ls21: .asciz "__getreent"
-.Ls22: .asciz "__gtdf2"
-.Ls23: .asciz "__ledf2"
-.Ls24: .asciz "__lshrdi3"
-.Ls25: .asciz "__ltdf2"
-.Ls26: .asciz "__moddi3"
-.Ls27: .asciz "__muldf3"
-.Ls28: .asciz "__muldi3"
-.Ls29: .asciz "__nedf2"
-.Ls30: .asciz "__negdf2"
-.Ls31: .asciz "__subdf3"
-.Ls32: .asciz "__truncdfsf2"
-.Ls33: .asciz "__udivdi3"
-.Ls34: .asciz "__umoddi3"
-.Ls35: .asciz "__unorddf2"
-.Ls36: .asciz "abort"
-.Ls37: .asciz "abs"
-.Ls38: .asciz "acos"
-.Ls39: .asciz "asin"
-.Ls40: .asciz "atan"
-.Ls41: .asciz "atan2"
-.Ls42: .asciz "atan2f"
-.Ls43: .asciz "atof"
-.Ls44: .asciz "atoi"
-.Ls45: .asciz "atol"
-.Ls46: .asciz "bsearch"
-.Ls47: .asciz "calloc"
-.Ls48: .asciz "ceil"
-.Ls49: .asciz "ceilf"
-.Ls50: .asciz "closedir"
-.Ls51: .asciz "cos"
-.Ls52: .asciz "cosf"
-.Ls53: .asciz "cosh"
-.Ls54: .asciz "exit"
-.Ls55: .asciz "exp"
-.Ls56: .asciz "expf"
-.Ls57: .asciz "fabs"
-.Ls58: .asciz "fabsf"
-.Ls59: .asciz "fclose"
-.Ls60: .asciz "feof"
-.Ls61: .asciz "ferror"
-.Ls62: .asciz "fflush"
-.Ls63: .asciz "fgetc"
-.Ls64: .asciz "fgets"
-.Ls65: .asciz "floor"
-.Ls66: .asciz "floorf"
-.Ls67: .asciz "fmod"
-.Ls68: .asciz "fmodf"
-.Ls69: .asciz "fopen"
-.Ls70: .asciz "fprintf"
-.Ls71: .asciz "fputc"
-.Ls72: .asciz "fputs"
-.Ls73: .asciz "fread"
-.Ls74: .asciz "free"
-.Ls75: .asciz "fscanf"
-.Ls76: .asciz "fseek"
-.Ls77: .asciz "ftell"
-.Ls78: .asciz "fwrite"
-.Ls79: .asciz "getchar"
-.Ls80: .asciz "gfx_blit"
-.Ls81: .asciz "gfx_circle"
-.Ls82: .asciz "gfx_clear"
-.Ls83: .asciz "gfx_clip"
-.Ls84: .asciz "gfx_fill_circle"
-.Ls85: .asciz "gfx_fill_rect"
-.Ls86: .asciz "gfx_fill_round_rect"
-.Ls87: .asciz "gfx_fill_triangle"
-.Ls88: .asciz "gfx_flush"
-.Ls89: .asciz "gfx_flush_rect"
-.Ls90: .asciz "gfx_font"
-.Ls91: .asciz "gfx_font_h"
-.Ls92: .asciz "gfx_font_w"
-.Ls93: .asciz "gfx_framebuffer"
-.Ls94: .asciz "gfx_get_pixel"
-.Ls95: .asciz "gfx_hline"
-.Ls96: .asciz "gfx_line"
-.Ls97: .asciz "gfx_noclip"
-.Ls98: .asciz "gfx_pixel"
-.Ls99: .asciz "gfx_printf"
-.Ls100: .asciz "gfx_rect"
-.Ls101: .asciz "gfx_round_rect"
-.Ls102: .asciz "gfx_scroll"
-.Ls103: .asciz "gfx_text"
-.Ls104: .asciz "gfx_text_bg"
-.Ls105: .asciz "gfx_text_width"
-.Ls106: .asciz "gfx_triangle"
-.Ls107: .asciz "gfx_vline"
-.Ls108: .asciz "hypot"
-.Ls109: .asciz "isalnum"
-.Ls110: .asciz "isalpha"
-.Ls111: .asciz "isdigit"
-.Ls112: .asciz "islower"
-.Ls113: .asciz "isprint"
-.Ls114: .asciz "ispunct"
-.Ls115: .asciz "isspace"
-.Ls116: .asciz "isupper"
-.Ls117: .asciz "isxdigit"
-.Ls118: .asciz "kbd_backlight"
-.Ls119: .asciz "kbd_down"
-.Ls120: .asciz "kbd_event"
-.Ls121: .asciz "kbd_flush"
-.Ls122: .asciz "kbd_get"
-.Ls123: .asciz "kbd_mods"
-.Ls124: .asciz "kbd_wait"
-.Ls125: .asciz "labs"
-.Ls126: .asciz "log"
-.Ls127: .asciz "log10"
-.Ls128: .asciz "log2"
-.Ls129: .asciz "logf"
-.Ls130: .asciz "longjmp"
-.Ls131: .asciz "malloc"
-.Ls132: .asciz "memchr"
-.Ls133: .asciz "memcmp"
-.Ls134: .asciz "memcpy"
-.Ls135: .asciz "memmove"
-.Ls136: .asciz "memset"
-.Ls137: .asciz "mkdir"
-.Ls138: .asciz "opendir"
-.Ls139: .asciz "pow"
-.Ls140: .asciz "powf"
-.Ls141: .asciz "printf"
-.Ls142: .asciz "putchar"
-.Ls143: .asciz "puts"
-.Ls144: .asciz "qsort"
-.Ls145: .asciz "rand"
-.Ls146: .asciz "readdir"
-.Ls147: .asciz "realloc"
-.Ls148: .asciz "remove"
-.Ls149: .asciz "rename"
-.Ls150: .asciz "rewind"
-.Ls151: .asciz "round"
-.Ls152: .asciz "roundf"
-.Ls153: .asciz "setjmp"
-.Ls154: .asciz "sin"
-.Ls155: .asciz "sinf"
-.Ls156: .asciz "sinh"
-.Ls157: .asciz "snd_busy"
-.Ls158: .asciz "snd_play"
-.Ls159: .asciz "snd_stop"
-.Ls160: .asciz "snd_tone"
-.Ls161: .asciz "snd_volume"
-.Ls162: .asciz "snprintf"
-.Ls163: .asciz "sprintf"
-.Ls164: .asciz "sqrt"
-.Ls165: .asciz "sqrtf"
-.Ls166: .asciz "srand"
-.Ls167: .asciz "sscanf"
-.Ls168: .asciz "stat"
-.Ls169: .asciz "strcasecmp"
-.Ls170: .asciz "strcat"
-.Ls171: .asciz "strchr"
-.Ls172: .asciz "strcmp"
-.Ls173: .asciz "strcpy"
-.Ls174: .asciz "strcspn"
-.Ls175: .asciz "strdup"
-.Ls176: .asciz "strlen"
-.Ls177: .asciz "strncasecmp"
-.Ls178: .asciz "strncat"
-.Ls179: .asciz "strncmp"
-.Ls180: .asciz "strncpy"
-.Ls181: .asciz "strrchr"
-.Ls182: .asciz "strspn"
-.Ls183: .asciz "strstr"
-.Ls184: .asciz "strtod"
-.Ls185: .asciz "strtof"
-.Ls186: .asciz "strtok"
-.Ls187: .asciz "strtol"
-.Ls188: .asciz "strtoul"
-.Ls189: .asciz "sys_backlight"
-.Ls190: .asciz "sys_battery"
-.Ls191: .asciz "sys_delay"
-.Ls192: .asciz "sys_exit"
-.Ls193: .asciz "sys_exit_to_loader"
-.Ls194: .asciz "sys_free_heap"
-.Ls195: .asciz "sys_log"
-.Ls196: .asciz "sys_micros"
-.Ls197: .asciz "sys_millis"
-.Ls198: .asciz "sys_random"
-.Ls199: .asciz "sys_seed"
-.Ls200: .asciz "sys_yield"
-.Ls201: .asciz "tan"
-.Ls202: .asciz "tanf"
-.Ls203: .asciz "tanh"
-.Ls204: .asciz "tolower"
-.Ls205: .asciz "toupper"
-.Ls206: .asciz "trunc"
-.Ls207: .asciz "unlink"
-.Ls208: .asciz "vprintf"
-.Ls209: .asciz "vsnprintf"
+.Ls1: .asciz "__addsf3"
+.Ls2: .asciz "__ashldi3"
+.Ls3: .asciz "__ashrdi3"
+.Ls4: .asciz "__divdf3"
+.Ls5: .asciz "__divdi3"
+.Ls6: .asciz "__divsf3"
+.Ls7: .asciz "__eqdf2"
+.Ls8: .asciz "__eqsf2"
+.Ls9: .asciz "__errno"
+.Ls10: .asciz "__extendsfdf2"
+.Ls11: .asciz "__fixdfdi"
+.Ls12: .asciz "__fixdfsi"
+.Ls13: .asciz "__fixsfdi"
+.Ls14: .asciz "__fixsfsi"
+.Ls15: .asciz "__fixunsdfdi"
+.Ls16: .asciz "__fixunsdfsi"
+.Ls17: .asciz "__fixunssfdi"
+.Ls18: .asciz "__fixunssfsi"
+.Ls19: .asciz "__floatdidf"
+.Ls20: .asciz "__floatdisf"
+.Ls21: .asciz "__floatsidf"
+.Ls22: .asciz "__floatsisf"
+.Ls23: .asciz "__floatundidf"
+.Ls24: .asciz "__floatundisf"
+.Ls25: .asciz "__floatunsidf"
+.Ls26: .asciz "__floatunsisf"
+.Ls27: .asciz "__gedf2"
+.Ls28: .asciz "__getreent"
+.Ls29: .asciz "__gtdf2"
+.Ls30: .asciz "__ledf2"
+.Ls31: .asciz "__lesf2"
+.Ls32: .asciz "__lshrdi3"
+.Ls33: .asciz "__ltdf2"
+.Ls34: .asciz "__ltsf2"
+.Ls35: .asciz "__moddi3"
+.Ls36: .asciz "__muldf3"
+.Ls37: .asciz "__muldi3"
+.Ls38: .asciz "__mulsf3"
+.Ls39: .asciz "__nedf2"
+.Ls40: .asciz "__negdf2"
+.Ls41: .asciz "__nesf2"
+.Ls42: .asciz "__subdf3"
+.Ls43: .asciz "__subsf3"
+.Ls44: .asciz "__truncdfsf2"
+.Ls45: .asciz "__udivdi3"
+.Ls46: .asciz "__umoddi3"
+.Ls47: .asciz "__unorddf2"
+.Ls48: .asciz "abort"
+.Ls49: .asciz "abs"
+.Ls50: .asciz "acos"
+.Ls51: .asciz "asin"
+.Ls52: .asciz "atan"
+.Ls53: .asciz "atan2"
+.Ls54: .asciz "atan2f"
+.Ls55: .asciz "atof"
+.Ls56: .asciz "atoi"
+.Ls57: .asciz "atol"
+.Ls58: .asciz "bsearch"
+.Ls59: .asciz "calloc"
+.Ls60: .asciz "ceil"
+.Ls61: .asciz "ceilf"
+.Ls62: .asciz "closedir"
+.Ls63: .asciz "cos"
+.Ls64: .asciz "cosf"
+.Ls65: .asciz "cosh"
+.Ls66: .asciz "exit"
+.Ls67: .asciz "exp"
+.Ls68: .asciz "expf"
+.Ls69: .asciz "fabs"
+.Ls70: .asciz "fabsf"
+.Ls71: .asciz "fclose"
+.Ls72: .asciz "feof"
+.Ls73: .asciz "ferror"
+.Ls74: .asciz "fflush"
+.Ls75: .asciz "fgetc"
+.Ls76: .asciz "fgets"
+.Ls77: .asciz "floor"
+.Ls78: .asciz "floorf"
+.Ls79: .asciz "fmod"
+.Ls80: .asciz "fmodf"
+.Ls81: .asciz "fopen"
+.Ls82: .asciz "fprintf"
+.Ls83: .asciz "fputc"
+.Ls84: .asciz "fputs"
+.Ls85: .asciz "fread"
+.Ls86: .asciz "free"
+.Ls87: .asciz "fscanf"
+.Ls88: .asciz "fseek"
+.Ls89: .asciz "ftell"
+.Ls90: .asciz "fwrite"
+.Ls91: .asciz "getchar"
+.Ls92: .asciz "gfx_blit"
+.Ls93: .asciz "gfx_circle"
+.Ls94: .asciz "gfx_clear"
+.Ls95: .asciz "gfx_clip"
+.Ls96: .asciz "gfx_fill_circle"
+.Ls97: .asciz "gfx_fill_rect"
+.Ls98: .asciz "gfx_fill_round_rect"
+.Ls99: .asciz "gfx_fill_triangle"
+.Ls100: .asciz "gfx_flush"
+.Ls101: .asciz "gfx_flush_rect"
+.Ls102: .asciz "gfx_font"
+.Ls103: .asciz "gfx_font_h"
+.Ls104: .asciz "gfx_font_w"
+.Ls105: .asciz "gfx_framebuffer"
+.Ls106: .asciz "gfx_get_pixel"
+.Ls107: .asciz "gfx_hline"
+.Ls108: .asciz "gfx_line"
+.Ls109: .asciz "gfx_noclip"
+.Ls110: .asciz "gfx_pixel"
+.Ls111: .asciz "gfx_printf"
+.Ls112: .asciz "gfx_rect"
+.Ls113: .asciz "gfx_round_rect"
+.Ls114: .asciz "gfx_scroll"
+.Ls115: .asciz "gfx_text"
+.Ls116: .asciz "gfx_text_bg"
+.Ls117: .asciz "gfx_text_width"
+.Ls118: .asciz "gfx_triangle"
+.Ls119: .asciz "gfx_vline"
+.Ls120: .asciz "hypot"
+.Ls121: .asciz "isalnum"
+.Ls122: .asciz "isalpha"
+.Ls123: .asciz "isdigit"
+.Ls124: .asciz "islower"
+.Ls125: .asciz "isprint"
+.Ls126: .asciz "ispunct"
+.Ls127: .asciz "isspace"
+.Ls128: .asciz "isupper"
+.Ls129: .asciz "isxdigit"
+.Ls130: .asciz "kbd_backlight"
+.Ls131: .asciz "kbd_down"
+.Ls132: .asciz "kbd_event"
+.Ls133: .asciz "kbd_flush"
+.Ls134: .asciz "kbd_get"
+.Ls135: .asciz "kbd_mods"
+.Ls136: .asciz "kbd_wait"
+.Ls137: .asciz "labs"
+.Ls138: .asciz "log"
+.Ls139: .asciz "log10"
+.Ls140: .asciz "log2"
+.Ls141: .asciz "logf"
+.Ls142: .asciz "longjmp"
+.Ls143: .asciz "malloc"
+.Ls144: .asciz "memchr"
+.Ls145: .asciz "memcmp"
+.Ls146: .asciz "memcpy"
+.Ls147: .asciz "memmove"
+.Ls148: .asciz "memset"
+.Ls149: .asciz "mkdir"
+.Ls150: .asciz "opendir"
+.Ls151: .asciz "pow"
+.Ls152: .asciz "powf"
+.Ls153: .asciz "printf"
+.Ls154: .asciz "putchar"
+.Ls155: .asciz "puts"
+.Ls156: .asciz "qsort"
+.Ls157: .asciz "rand"
+.Ls158: .asciz "readdir"
+.Ls159: .asciz "realloc"
+.Ls160: .asciz "remove"
+.Ls161: .asciz "rename"
+.Ls162: .asciz "rewind"
+.Ls163: .asciz "round"
+.Ls164: .asciz "roundf"
+.Ls165: .asciz "setjmp"
+.Ls166: .asciz "sin"
+.Ls167: .asciz "sinf"
+.Ls168: .asciz "sinh"
+.Ls169: .asciz "snd_busy"
+.Ls170: .asciz "snd_play"
+.Ls171: .asciz "snd_stop"
+.Ls172: .asciz "snd_tone"
+.Ls173: .asciz "snd_volume"
+.Ls174: .asciz "snprintf"
+.Ls175: .asciz "sprintf"
+.Ls176: .asciz "sqrt"
+.Ls177: .asciz "sqrtf"
+.Ls178: .asciz "srand"
+.Ls179: .asciz "sscanf"
+.Ls180: .asciz "stat"
+.Ls181: .asciz "strcasecmp"
+.Ls182: .asciz "strcat"
+.Ls183: .asciz "strchr"
+.Ls184: .asciz "strcmp"
+.Ls185: .asciz "strcpy"
+.Ls186: .asciz "strcspn"
+.Ls187: .asciz "strdup"
+.Ls188: .asciz "strlen"
+.Ls189: .asciz "strncasecmp"
+.Ls190: .asciz "strncat"
+.Ls191: .asciz "strncmp"
+.Ls192: .asciz "strncpy"
+.Ls193: .asciz "strrchr"
+.Ls194: .asciz "strspn"
+.Ls195: .asciz "strstr"
+.Ls196: .asciz "strtod"
+.Ls197: .asciz "strtof"
+.Ls198: .asciz "strtok"
+.Ls199: .asciz "strtol"
+.Ls200: .asciz "strtoul"
+.Ls201: .asciz "sys_backlight"
+.Ls202: .asciz "sys_battery"
+.Ls203: .asciz "sys_delay"
+.Ls204: .asciz "sys_exit"
+.Ls205: .asciz "sys_exit_to_loader"
+.Ls206: .asciz "sys_free_heap"
+.Ls207: .asciz "sys_log"
+.Ls208: .asciz "sys_micros"
+.Ls209: .asciz "sys_millis"
+.Ls210: .asciz "sys_random"
+.Ls211: .asciz "sys_seed"
+.Ls212: .asciz "sys_yield"
+.Ls213: .asciz "tan"
+.Ls214: .asciz "tanf"
+.Ls215: .asciz "tanh"
+.Ls216: .asciz "tolower"
+.Ls217: .asciz "toupper"
+.Ls218: .asciz "trunc"
+.Ls219: .asciz "unlink"
+.Ls220: .asciz "vprintf"
+.Ls221: .asciz "vsnprintf"

@@ -5,7 +5,7 @@ Copied to `/sd/pico-dev/tests/` and `/sd/pico-dev/projects/` on the SD card.
 
 | Dir | What | How it's checked |
 |---|---|---|
-| `unit/` | Tier A: `t01`–`t20`, one `.c` + `.expected` each, print a transcript and return 0 | stdout must equal `.expected` |
+| `unit/` | Tier A: `t01`–`t21`, one `.c` + `.expected` each, print a transcript and return 0 | stdout must equal `.expected` |
 | `errors/` | `err01`–`err12`, must fail; first line `// EXPECT: <compile\|link> line=<n\|m> match=<regex>` | diagnostic kind, line and message |
 | `projects/` | Tier B: full SDK apps (`setup`/`loop`), each with `project.cfg` | build + run by hand / `@shot` on device |
 

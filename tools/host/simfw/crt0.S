@@ -23,7 +23,9 @@ _start:
     j       2b
 3:  li      t0, 0x2000              /* mstatus.FS = initial: FPU on (as the ESP-IDF startup does) */
     csrs    mstatus, t0
+#ifdef __riscv_flen
     fscsr   zero                    /* round to nearest, flags clear */
+#endif
     mv      a0, s0
     mv      a1, s1
     mv      a2, sp

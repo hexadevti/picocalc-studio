@@ -8,6 +8,7 @@
 //  * The battery register 0x0B rides the same poll every 10s, only in place of a FIFO select that
 //    came back empty: {0x0B, v}, percent = v & 0x7F, bit 7 = charging.
 //  * Backlights: write (reg | 0x80, level); 0x0A = LCD, 0x05 = keyboard.
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include "../../../board.h"
 #include <Arduino.h>
 #include <Wire.h>
@@ -180,3 +181,5 @@ int  hal_battery_percent()           { return s_batPercent; }
 bool hal_battery_charging()          { return s_batCharging; }
 void hal_lcd_backlight(uint8_t level) { s_lcdBkl = level; }
 void hal_kbd_backlight(uint8_t level) { s_kbdBkl = level; }
+
+#endif  // ESP_PLATFORM

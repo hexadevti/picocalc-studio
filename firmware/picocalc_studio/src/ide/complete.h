@@ -5,9 +5,14 @@
 
 #include "doc.h"
 
-// The include folder and the open project ("" for none). Call it again after files are saved,
+// The include folder, the library sources folder (where F9 finds the definitions of what the
+// headers declare) and the open project ("" for none). Call it again after files are saved,
 // added or deleted, so the project's names are read again.
-void ac_project(const char *includeDir, const char *projDir);
+void ac_project(const char *includeDir, const char *libDir, const char *projDir);
+
+// Files of other projects the project includes (#include "../other/x.h"): read with the project's.
+// Call it after ac_project().
+void ac_extra(const char *const *paths, int n);
 
 bool ac_active();
 void ac_close();
@@ -33,3 +38,12 @@ void ac_draw(const Doc *d, int y0, int rows);
 // For the status bar: the declaration of the chosen name while the list is open. Null if there is
 // none.
 const char *ac_hint();
+
+// F9: where the name at (or just before) the cursor of d is declared. In order: a local variable
+// or parameter of the function the cursor is in; a global (function, macro, type, enum constant,
+// variable) of the open files, the project's files, the library sources or the headers, its
+// definition rather than a prototype or extern; else (and for a member, after . or ->) the first use that looks like a
+// declaration in those files. Fills path and the 0-based line and col; name gets the name ("" if
+// the cursor isn't on one). False if nothing is found.
+bool ac_find_decl(Doc *const *docs, int ndocs, Doc *d, char *name, int nameSize, char *path, int pathSize,
+                  int *line, int *col);

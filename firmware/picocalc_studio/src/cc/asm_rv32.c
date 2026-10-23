@@ -27,18 +27,56 @@ static int32_t last_jump = -1;  // offset of the last standalone rv_jump
 static int last_jump_label;
 
 void sect_append(CcSection *s, const void *data, uint32_t n) {
-  if (s->size + n > s->cap) {
+  uint32_t used = s->size - s->base;
+  if (used + n > s->cap) {
     uint32_t cap = s->cap ? s->cap : 256;
-    while (cap < s->size + n)
-      cap *= 2;
+    // Past 8 KB in steps: less slack, and a smaller transient while cc_grow() copies.
+    while (cap < used + n)
+      cap = cap < 8192 ? cap * 2 : cap + 8192;
     s->data = cc_grow(s->data, s->cap, cap);
     s->cap = cap;
   }
   if (data)
-    memcpy(s->data + s->size, data, n);
+    memcpy(s->data + used, data, n);
   else
-    memset(s->data + s->size, 0, n);
+    memset(s->data + used, 0, n);
   s->size += n;
+}
+
+// Relocations are kept in blocks of up to 8 KB, not one array: growing that would need room for
+// the old and the new copy at once.
+CcReloc *cc_new_reloc(CcObject *o) {
+  int b = o->nrelocs / CC_RELOC_BLOCK, i = o->nrelocs % CC_RELOC_BLOCK;
+  if (o->nrelocs == o->caprelocs) {  // block b, if any, is full at i entries
+    if (!i) {
+      if (!(b & (b - 1))) {  // 0 or a power of 2: the block list is full
+        int cap = b ? b * 2 : 4;
+        o->relocs = cc_grow(o->relocs, sizeof(CcReloc *) * b, sizeof(CcReloc *) * cap);
+      }
+      o->relocs[b] = NULL;
+    }
+    int cap = i ? i * 2 : 64;
+    o->relocs[b] = cc_grow(o->relocs[b], sizeof(CcReloc) * i, sizeof(CcReloc) * cap);
+    o->caprelocs += cap - i;
+  }
+  o->nrelocs++;
+  return &o->relocs[b][i];
+}
+
+// Finishes the bytes written so far as a part of their own, once they are 8 KB: growing one big
+// array would need room for the old and the new copy at once.
+static void sect_split(CcSection *s) {
+  uint32_t used = s->size - s->base;
+  if (used < 8192)
+    return;
+  if (!(s->nparts & (s->nparts - 1))) {  // 0 or a power of 2: full
+    int cap = s->nparts ? s->nparts * 2 : 4;
+    s->parts = cc_grow(s->parts, sizeof(CcPart) * s->nparts, sizeof(CcPart) * cap);
+  }
+  s->parts[s->nparts++] = (CcPart){cc_grow_keep(s->data, used), used};
+  s->data = NULL;
+  s->cap = 0;
+  s->base = s->size;
 }
 
 void sect_align(CcSection *s, uint32_t align) {
@@ -70,13 +108,16 @@ uint32_t asm_pc(void) { return text->size; }
 
 void emit32(uint32_t insn) { sect_append(text, &insn, 4); }
 
+// Code of the current function: at or past text->base.
+static uint8_t *text_at(uint32_t off) { return text->data + (off - text->base); }
+
 static uint32_t read32(uint32_t off) {
   uint32_t v;
-  memcpy(&v, text->data + off, 4);
+  memcpy(&v, text_at(off), 4);
   return v;
 }
 
-static void write32(uint32_t off, uint32_t v) { memcpy(text->data + off, &v, 4); }
+static void write32(uint32_t off, uint32_t v) { memcpy(text_at(off), &v, 4); }
 
 int asm_new_label(void) {
   if (nlabels == caplabels) {
@@ -120,6 +161,7 @@ static uint32_t enc_b(int32_t imm) {
 }
 
 void asm_begin_function(void) {
+  sect_split(text);
   func_start = fence = text->size;
   func_relocs = obj->nrelocs;
   second_pass = false;
@@ -144,7 +186,7 @@ void asm_rollback(void) {
 uint32_t *asm_last_insn(void) {
   if (text->size < fence + 4)
     return NULL;
-  return (uint32_t *)(text->data + text->size - 4);
+  return (uint32_t *)text_at(text->size - 4);
 }
 
 void asm_end_function(void) {
@@ -166,7 +208,7 @@ void asm_end_function(void) {
       write32(f->off, (insn & 0x01fff07f) | enc_b(d));
       break;
     case FX_PAIR:
-      rv_patch_pair(text->data + f->off, d);
+      rv_patch_pair(text_at(f->off), d);
       break;
     }
   }
@@ -313,12 +355,7 @@ void rv_label_addr(int rd, int label) {
 }
 
 static void add_reloc(int sym, int32_t addend, int line) {
-  if (obj->nrelocs == obj->caprelocs) {
-    int cap = obj->caprelocs ? obj->caprelocs * 2 : 64;
-    obj->relocs = cc_grow(obj->relocs, sizeof(CcReloc) * obj->caprelocs, sizeof(CcReloc) * cap);
-    obj->caprelocs = cap;
-  }
-  obj->relocs[obj->nrelocs++] = (CcReloc){CC_TEXT, text->size, CC_R_PAIR, sym, addend, line};
+  *cc_new_reloc(obj) = (CcReloc){.offset = text->size, .addend = addend, .sym = sym, .sect = CC_TEXT, .type = CC_R_PAIR, .line = line};
 }
 
 void rv_sym_addr(int rd, int sym, int32_t addend, int line) {

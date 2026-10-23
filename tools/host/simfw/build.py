@@ -22,14 +22,18 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-OUT = os.path.join(ROOT, "build", "host", "simfw")
+# PICO_SOFT_FLOAT=1: everything for rv32imac / ilp32 instead (the RP2350's Hazard3 has no F), in
+# build/host/simfw-soft; pair it with pcc -msoft-float.
+SOFT = os.environ.get("PICO_SOFT_FLOAT") == "1"
+OUT = os.path.join(ROOT, "build", "host", "simfw-soft" if SOFT else "simfw")
 LDSCRIPT = os.path.join(HERE, "simfw.ld")
 SOURCES = ["crt0.S", "syscalls.c", "dirent.c"]
 DEPS = SOURCES + ["sim_syscalls.h"]
 
 RV_GCC_GLOB = os.path.expanduser(
     r"~/.emu6502-p4/data/packages/esp32/tools/esp-rv32/*/bin/riscv32-esp-elf-gcc.exe")
-ARCH = ["-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"]
+ARCH = (["-march=rv32imac_zicsr_zifencei", "-mabi=ilp32"] if SOFT
+        else ["-march=rv32imafc_zicsr_zifencei", "-mabi=ilp32f"])
 USER_CFLAGS = ["-O1", "-std=gnu11"]
 SIMFW_CFLAGS = ["-O2", "-std=gnu11", "-g", "-Wall", "-Wextra", "-ffunction-sections"]
 LIBS = ["-Wl,--start-group", "-lc", "-lm", "-lgcc", "-Wl,--end-group"]

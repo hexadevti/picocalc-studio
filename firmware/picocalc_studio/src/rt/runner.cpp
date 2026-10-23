@@ -4,6 +4,7 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include "../../board.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
@@ -14,10 +15,17 @@
 #include "../cc/cc.h"
 #include "exports.h"
 #include "module.h"
+#include "../ide/doc.h"
 #include "runner.h"
+#include "selftest.h"
 
 #define INCLUDE_DIR "/sd/pico-dev/include"
+#ifndef PROGRAM_STACK
 #define PROGRAM_STACK (32 * 1024)
+#endif
+#ifndef BUILD_STACK
+#define BUILD_STACK (32 * 1024)
+#endif
 #define BREAK_GRACE_MS 500
 
 #define BIT_DONE  1u
@@ -260,7 +268,7 @@ const char *rt_end_name(RtEnd end) {
   return "?";
 }
 
-int rt_run(const void *image, size_t size, const RtRunOptions *opt, RtRunResult *r) {
+static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtRunResult *r) {
   memset(r, 0, sizeof *r);
   if (g.task) { snprintf(r->err, sizeof r->err, "a program is already running"); return -1; }
   static RtModule m;
@@ -346,6 +354,8 @@ int rt_run(const void *image, size_t size, const RtRunOptions *opt, RtRunResult 
 
 static int haveImport(const char *name) { return rt_find_export(name) != nullptr; }
 
+static size_t s_buildPeak;   // cc_arena_peak() of the last rt_build()
+
 uint8_t *rt_build(const char *const *paths, int n, size_t *size) {
   const char *incs[] = {INCLUDE_DIR};
   CcOptions opt = {incs, 1, nullptr, 0, haveImport};
@@ -355,6 +365,7 @@ uint8_t *rt_build(const char *const *paths, int n, size_t *size) {
   for (int i = 0; ok && i < n; i++) ok = cc_compile(&opt, paths[i], &objs[i]) == 0;
   if (ok && cc_link(objs, n, &opt, &image, size) != 0) image = nullptr;
   free(objs);
+  s_buildPeak = cc_arena_peak();
   cc_arena_free();
   return image;
 }
@@ -364,6 +375,18 @@ uint8_t *rt_build(const char *const *paths, int n, size_t *size) {
 static char s_runPath[128];
 static int s_runTimes;
 static volatile bool s_runPending;
+
+int rt_run(const void *image, size_t size, const RtRunOptions *opt, RtRunResult *r) {
+#ifdef CC_BORROW_FRAMEBUFFER
+  // No PSRAM: the program gets the room of the saved docs too, read back when it ends.
+  doc_park_all();
+  const int rc = runImage(image, size, opt, r);
+  doc_unpark_all();
+  return rc;
+#else
+  return runImage(image, size, opt, r);
+#endif
+}
 
 bool rt_run_cmd(const char *line) {
   if (strncmp(line, "@run ", 5)) return false;
@@ -393,17 +416,90 @@ struct BuildJob { const char *const *paths; int n; size_t size; uint8_t *image; 
 
 static void buildTask(void *arg) {
   BuildJob *j = (BuildJob *)arg;
+  // The compiler stops at nesting deeper than this; the rest is for rt_build, FatFS and errors.
+  cc_stack_limit = BUILD_STACK - 8 * 1024;
   j->image = rt_build(j->paths, j->n, &j->size);
+  cc_stack_limit = 0;
   xTaskNotifyGive(j->waiter);
-  vTaskDelete(nullptr);
+  // The waiter deletes this task: that frees the stack at once, where a self-delete leaves it to
+  // the idle task, and the program task about to be created may need the room.
+  vTaskSuspend(nullptr);
 }
 
+#ifdef CC_BORROW_FRAMEBUFFER
+// The biggest block malloc() can give now, to within 1 KB.
+static size_t largestBlock() {
+  size_t lo = 0, hi = heap_caps_get_free_size(MALLOC_CAP_8BIT) >> 10;
+  while (lo < hi) {
+    const size_t mid = (lo + hi + 1) / 2;
+    void *p = malloc(mid << 10);
+    if (p) { free(p); lo = mid; }
+    else hi = mid - 1;
+  }
+  return lo;
+}
+#endif
+
+#ifdef CC_BORROW_FRAMEBUFFER
+static void oomHook(const char *what, size_t n, size_t lentFree, size_t lentLargest) {
+  hal_log("build: out of memory for a %u-byte %s; heap %u free, largest block %u KB; lent %u free, "
+          "largest %u", (unsigned)n, what, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          (unsigned)largestBlock(), (unsigned)lentFree, (unsigned)lentLargest);
+}
+#endif
+
+static RtBuildMemory s_buildMem;
+
+const RtBuildMemory *rt_build_memory() { return &s_buildMem; }
+
 uint8_t *rt_build_big(const char *const *paths, int n, size_t *size) {
+#ifdef CC_BORROW_FRAMEBUFFER
+  cc_oom_hook = oomHook;
+  // The lines of saved docs are read back from the card afterwards, and the room goes to the build.
+  const size_t heap0 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+  doc_park_all();
+  const size_t heap1 = heap_caps_get_free_size(MALLOC_CAP_8BIT), big1 = largestBlock();
+  // No PSRAM: the compiler also gets the framebuffer while the caller waits. The screen keeps its
+  // picture; the framebuffer comes back cleared, and the caller redraws.
+  color_t *fb = gfx_framebuffer();
+  const size_t fbSize = SCREEN_W * SCREEN_H * sizeof(color_t);
+  cc_arena_lend(fb, fbSize);
+#endif
   BuildJob j = {paths, n, 0, nullptr, xTaskGetCurrentTaskHandle()};
-  if (xTaskCreatePinnedToCore(buildTask, "ccbuild", 64 * 1024, &j, uxTaskPriorityGet(nullptr), nullptr,
-                              xPortGetCoreID()) != pdPASS)
-    return rt_build(paths, n, size);
-  ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+  TaskHandle_t task;
+  if (xTaskCreatePinnedToCore(buildTask, "ccbuild", BUILD_STACK, &j, uxTaskPriorityGet(nullptr), &task,
+                              xPortGetCoreID()) != pdPASS) {
+    j.image = rt_build(paths, n, &j.size);
+  } else {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    while (eTaskGetState(task) != eSuspended) vTaskDelay(1);
+    vTaskDelete(task);
+  }
+#ifdef CC_BORROW_FRAMEBUFFER
+  const bool lent = j.image && cc_arena_is_lent(j.image);
+  cc_arena_lend(nullptr, 0);
+  // The image is in the framebuffer, or among the compiler's heap chunks, now free: move it to the
+  // bottom of the heap (through the framebuffer) so it doesn't split the room the program needs.
+  if (j.image && j.size <= fbSize) {
+    memmove(fb, j.image, j.size);
+    if (!lent) free(j.image);
+    if ((j.image = (uint8_t *)malloc(j.size))) memcpy(j.image, fb, j.size);
+    else hal_log("build: out of memory for the %u-byte image", (unsigned)j.size);
+  }
+  memset(fb, 0, fbSize);
+  const size_t lentPeak = cc_lent_peak();
+  doc_unpark_all();
+  RtBuildMemory &m = s_buildMem;
+  m = {true, heap0, heap1, big1 << 10, s_buildPeak, lentPeak, fbSize,
+       heap_caps_get_free_size(MALLOC_CAP_8BIT), largestBlock() << 10};
+  // Every build, so a near miss shows before it becomes an out-of-memory error.
+  hal_log("build memory (%s): heap %u KB free, %u KB after parking docs (largest block %u KB); "
+          "compiler peak %u KB, %u of the %u KB framebuffer; after: heap %u KB free (largest block "
+          "%u KB) with the %u-byte image", j.image ? "ok" : "failed", (unsigned)(m.heapBefore >> 10),
+          (unsigned)(m.heapParked >> 10), (unsigned)(m.largestParked >> 10),
+          (unsigned)(m.compilerPeak >> 10), (unsigned)(m.lentPeak >> 10), (unsigned)(m.lentSize >> 10),
+          (unsigned)(m.heapAfter >> 10), (unsigned)(m.largestAfter >> 10), (unsigned)j.size);
+#endif
   *size = j.size;
   return j.image;
 }
@@ -429,6 +525,7 @@ int rt_list_sources(const char *dir, char **files, int max) {
 }
 
 bool rt_service() {
+  if (rt_selftest_service()) return true;
   if (!s_runPending) return false;
   // A directory is a project: every .c in it.
   char *files[32];

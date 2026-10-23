@@ -229,8 +229,12 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
   uint8_t *data = calloc(1, data_size ? data_size : 4);
   for (int i = 0; i < n; i++) {
     CcObject *o = objs[i];
-    if (o->sect[CC_TEXT].size)
-      memcpy(text + sect_base[i][CC_TEXT], o->sect[CC_TEXT].data, o->sect[CC_TEXT].size);
+    CcSection *t = &o->sect[CC_TEXT];
+    uint8_t *p = text + sect_base[i][CC_TEXT];
+    for (int k = 0; k < t->nparts; p += t->parts[k++].size)
+      memcpy(p, t->parts[k].data, t->parts[k].size);
+    if (t->size > t->base)
+      memcpy(p, t->data, t->size - t->base);
     for (int sect = CC_RODATA; sect <= CC_DATA; sect++)
       if (o->sect[sect].size)
         memcpy(data + sect_base[i][sect], o->sect[sect].data, o->sect[sect].size);
@@ -241,7 +245,7 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
   for (int i = 0; i < n; i++) {
     CcObject *o = objs[i];
     for (int r = 0; r < o->nrelocs; r++) {
-      CcReloc *rel = &o->relocs[r];
+      CcReloc *rel = &o->relocs[r / CC_RELOC_BLOCK][r % CC_RELOC_BLOCK];
       CcSym *s = &o->syms[rel->sym];
       Target t = sym_target(i, s);
       if (t.kind < 0) {
@@ -319,9 +323,9 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
 
   size_t total = sizeof(h) + text_size + data_size + imp.size + relocs.size + lines.size +
                  files.size + strtab.size;
-  uint8_t *outp = malloc(total);
+  uint8_t *outp = cc_image_alloc(total);
   if (!outp)
-    error("out of memory");
+    cc_out_of_memory("image", total);
   uint8_t *p = outp;
 #define PUT(src, len) (memcpy(p, (src), (len)), p += (len))
   PUT(&h, sizeof(h));

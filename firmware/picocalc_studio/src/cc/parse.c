@@ -192,10 +192,39 @@ static Type *find_tag(Token *tok) {
   return NULL;
 }
 
+// Inside a root function's body each batch of statements (see splits_body()) has its tokens
+// recycled once parsed. The Nodes made since the last batch are listed here, and then pointed at
+// position tokens instead (pos_token()).
+static Node **batch_nodes;
+static int nbatch_nodes, batch_nodes_cap;
+static bool body_batches;  // the body being parsed is recycled batch by batch
+static int batch_gen;      // counts the batches recycled
+
+// Statement packing (see pack_stmt())
+static unsigned char *pk_buf;
+static int pk_len, pk_cap;
+static Type *pk_ty;
+static Token *pk_tok;
+static unsigned char *pk_in;
+static int no_pack;   // inside a statement expression
+static bool fn_vla;   // the function has a variable-length array
+
+static void track_node(Node *node) {
+  if (!body_batches)
+    return;
+  if (nbatch_nodes == batch_nodes_cap) {
+    int cap = batch_nodes_cap ? batch_nodes_cap * 2 : 256;
+    batch_nodes = cc_grow(batch_nodes, sizeof(Node *) * batch_nodes_cap, sizeof(Node *) * cap);
+    batch_nodes_cap = cap;
+  }
+  batch_nodes[nbatch_nodes++] = node;
+}
+
 static Node *new_node(NodeKind kind, Token *tok) {
-  Node *node = cc_fn_calloc(sizeof(Node));
+  Node *node = cc_node_calloc(sizeof(Node));
   node->kind = kind;
   node->tok = tok;
+  track_node(node);
   return node;
 }
 
@@ -254,11 +283,12 @@ Node *new_cast(Node *expr, Type *ty) {
   if (ty->kind != TY_VOID && from_agg != to_agg)
     error_tok(expr->tok, "incompatible types: cannot convert between struct/union and non-struct type");
 
-  Node *node = cc_fn_calloc(sizeof(Node));
+  Node *node = cc_node_calloc(sizeof(Node));
   node->kind = ND_CAST;
   node->tok = expr->tok;
   node->lhs = expr;
   node->ty = ty;  // nothing modifies a cast's type, so it can be shared
+  track_node(node);
   return node;
 }
 
@@ -356,8 +386,24 @@ static HashMap typename_map;
 // arena that held the previous one has been freed).
 static Obj *func_name;  // __func__ of the function being parsed, once used
 static bool keep_decl;  // the tokens of the declaration being parsed must outlive it
+static Token *decl_start;  // the first token of the top-level declaration not yet recycled
+static bool init_drop;     // a data table is being parsed: what is before tok can go (next_batch())
+
+// The parameters of the lists being parsed (one can hold others, a function pointer's). A
+// function type keeps only their types, which are shared (int, a typedef); the names of the list
+// parsed last stay on the stack for function(), which reads them right after its declarator.
+typedef struct {
+  Type *ty;
+  Token *name, *pos;
+} Param;
+
+static Param *param_stack;
+static int param_sp, param_cap;
+static Type *names_ty;  // the function type whose names are at names_base
+static int names_base;
 
 void parse_reset(void) {
+  type_reset();
   locals = globals = current_fn = builtin_alloca = NULL;
   global_scope = (Scope){0};
   scope = &global_scope;
@@ -367,6 +413,17 @@ void parse_reset(void) {
   typename_map = (HashMap){0};
   keep_decl = false;
   func_name = NULL;
+  decl_start = NULL;
+  init_drop = false;
+  param_stack = NULL;
+  param_sp = param_cap = 0;
+  names_ty = NULL;
+  batch_nodes = NULL;
+  nbatch_nodes = batch_nodes_cap = 0;
+  body_batches = false;
+  no_pack = 0;
+  pk_buf = NULL;
+  pk_len = pk_cap = 0;
 }
 
 static char *new_unique_name(void) {
@@ -378,9 +435,15 @@ static Obj *new_anon_gvar(Type *ty) {
   return new_gvar(new_unique_name(), ty);
 }
 
+// A string literal's data is emitted at once (codegen_string()), which gives its Obj a name and
+// an offset; the Obj only lets the Nodes refer to it, so it lives with them (in the function
+// arena if open) and in no scope.
 static Obj *new_string_literal(char *p, Type *ty) {
-  Obj *var = new_anon_gvar(ty);
-  var->init_data = p;
+  Obj *var = cc_fn_calloc(sizeof(Obj));
+  var->ty = ty;
+  var->align = ty->align;
+  var->is_static = true;
+  codegen_string(var, p);
   return var;
 }
 
@@ -681,17 +744,14 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
 // func-params = ("void" | param ("," param)* ("," "...")?)? ")"
 // param       = declspec declarator
 static Type *func_params(Token **rest, Token *tok, Type *ty) {
-  if (equal(tok, "void") && equal(tok->next, ")")) {
-    *rest = tok->next->next;
-    return func_type(ty);
-  }
+  int base = param_sp;
+  bool is_variadic = equal(tok, ")");
 
-  Type head = {};
-  Type *cur = &head;
-  bool is_variadic = false;
+  if (equal(tok, "void") && equal(tok->next, ")"))
+    tok = tok->next;
 
   while (!equal(tok, ")")) {
-    if (cur != &head)
+    if (param_sp != base)
       tok = skip(tok, ",");
 
     if (equal(tok, "...")) {
@@ -703,32 +763,37 @@ static Type *func_params(Token **rest, Token *tok, Type *ty) {
 
     Type *basety = declspec(&tok, tok, NULL);
     Type *ty2 = declarator(&tok, tok, basety);
-
-    Token *name = ty2->name;
+    Token *name = ty2->name, *pos = ty2->name_pos;
 
     if (ty2->kind == TY_ARRAY) {
       // "array of T" is converted to "pointer to T" only in the parameter
       // context. For example, *argv[] is converted to **argv by this.
       ty2 = pointer_to(ty2->base);
-      ty2->name = name;
     } else if (ty2->kind == TY_FUNC) {
       // Likewise, a function is converted to a pointer to a function
       // only in the parameter context.
       ty2 = pointer_to(ty2);
-      ty2->name = name;
     }
 
-    // The list is linked through Type::next, so a shared type (int, a typedef) needs a copy;
-    // one the declarator just built is ours.
-    cur = cur->next = ty2 == basety ? copy_type(ty2) : ty2;
+    if (param_sp == param_cap) {
+      int cap = param_cap ? param_cap * 2 : 16;
+      param_stack = cc_grow(param_stack, sizeof(Param) * param_cap, sizeof(Param) * cap);
+      param_cap = cap;
+    }
+    param_stack[param_sp++] = (Param){ty2, name, pos};
   }
 
-  if (cur == &head)
-    is_variadic = true;
-
+  int n = param_sp - base;
   ty = func_type(ty);
-  ty->params = head.next;
+  if (n) {
+    ty->params = cc_type_calloc(sizeof(Type *) * (n + 1));
+    for (int i = 0; i < n; i++)
+      ty->params[i] = param_stack[base + i].ty;
+  }
   ty->is_variadic = is_variadic;
+  param_sp = base;
+  names_ty = ty;
+  names_base = base;
   *rest = tok->next;
   return ty;
 }
@@ -747,8 +812,10 @@ static Type *array_dimensions(Token **rest, Token *tok, Type *ty) {
   tok = skip(tok, "]");
   ty = type_suffix(rest, tok, ty);
 
-  if (ty->kind == TY_VLA || !is_const_expr(expr))
+  if (ty->kind == TY_VLA || !is_const_expr(expr)) {
+    fn_vla = true;
     return vla_of(ty, expr);
+  }
   return array_of(ty, eval(expr));
 }
 
@@ -780,6 +847,7 @@ static Type *pointers(Token **rest, Token *tok, Type *ty) {
 
 // declarator = pointers ("(" ident ")" | "(" declarator ")" | ident) type-suffix
 static Type *declarator(Token **rest, Token *tok, Type *ty) {
+  check_stack(tok);
   ty = pointers(&tok, tok, ty);
 
   if (equal(tok, "(")) {
@@ -828,11 +896,372 @@ static Type *typename(Token **rest, Token *tok) {
   return abstract_declarator(rest, tok, ty);
 }
 
+// A long initializer comes in batches (see splits_init()): at the "," a batch ends with, this
+// fetches the next one, recycling the tokens already parsed if init_drop.
+static void next_batch(Token *tok) {
+  if (tok->next->kind != TK_MORE || !equal(tok, ","))
+    return;
+  if (init_drop && !keep_decl) {
+    preprocess_release_init(decl_start, tok);
+    decl_start = tok;
+  }
+  preprocess_more(tok->next);
+}
+
+// What codegen reads of a node's token once its batch is recycled: its file, line and column and
+// its origin's (add_line(), error_tok()). One copy per line, in the function arena, serves them
+// all, the column being that of the first one.
+static Token *pos_cache[8];
+static int pos_next;
+
+static Token *pos_token(Token *tok) {
+  if (!tok)
+    return NULL;
+  Token *root = tok->origin;
+  while (root && root->origin)
+    root = root->origin;
+  if (root)
+    root = pos_token(root);
+  for (int i = 0; i < 8; i++) {
+    Token *p = pos_cache[i];
+    if (p && p->file == tok->file && p->line_no == tok->line_no && p->origin == root)
+      return p;
+  }
+  Token *p = cc_fn_calloc(sizeof(Token));
+  *p = *tok;
+  p->next = NULL;
+  p->hideset = NULL;
+  p->origin = root;
+  p->pinned = false;
+  pos_cache[pos_next++ & 7] = p;
+  return p;
+}
+
+// Inside a function body, where a statement may follow a ";", the next batch is fetched (see
+// splits_body()), and in a root function the tokens of the last one recycled.
+static Token *stmt_batch(Token *tok) {
+  if (tok->kind != TK_MORE)
+    return tok;
+  if (body_batches) {
+    for (int i = 0; i < nbatch_nodes; i++)
+      batch_nodes[i]->tok = pos_token(batch_nodes[i]->tok);
+    nbatch_nodes = 0;
+    batch_gen++;
+    preprocess_release(decl_start, tok, false);
+    decl_start = tok;
+  }
+  return preprocess_more(tok);
+}
+
+//
+// Statement packing
+//
+// In a root function's body each statement parsed is encoded into a byte string, in the function
+// arena, and its Nodes are freed (the node arena is released back to where the statement began).
+// The code generator decodes one statement at a time (cc_unpack()), so a function's Nodes take
+// the memory of its largest statement, not of the whole body.
+//
+// Every node is a byte: its kind, 0x40 when its type is the previous node's, 0x80 when its token
+// is. The type and token pointers follow when they differ, then the kind's fields in a fixed
+// order. Statements that other code keeps pointers into (labels, cases, gotos to be resolved, a
+// switch's case list), statement expressions (their value is the last statement's) and functions
+// with variable-length arrays (a VLA type holds its length expression) are left as they are.
+
+#define PK_NULL 0x3F
+#define PK_SAME_TY 0x40
+#define PK_SAME_TOK 0x80
+
+
+static void pk_bytes(const void *p, int n) {
+  if (pk_len + n > pk_cap) {
+    int cap = pk_cap ? pk_cap * 2 : 1024;
+    while (cap < pk_len + n)
+      cap *= 2;
+    pk_buf = cc_grow(pk_buf, pk_cap, cap);
+    pk_cap = cap;
+  }
+  memcpy(pk_buf + pk_len, p, n);
+  pk_len += n;
+}
+
+static void pk_byte(int c) {
+  unsigned char b = c;
+  pk_bytes(&b, 1);
+}
+
+static void pk_ptr(const void *p) { pk_bytes(&p, sizeof(p)); }
+
+static void pk_int(int64_t v) {
+  uint64_t u = ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+  while (u >= 0x80) {
+    pk_byte(u | 0x80);
+    u >>= 7;
+  }
+  pk_byte(u);
+}
+
+static void *pk_rdptr(void) {
+  void *p;
+  memcpy(&p, pk_in, sizeof(p));
+  pk_in += sizeof(p);
+  return p;
+}
+
+static int64_t pk_rdint(void) {
+  uint64_t u = 0;
+  for (int sh = 0;; sh += 7) {
+    unsigned char b = *pk_in++;
+    u |= (uint64_t)(b & 0x7F) << sh;
+    if (!(b & 0x80))
+      break;
+  }
+  return (int64_t)(u >> 1) ^ -(int64_t)(u & 1);
+}
+
+static bool packable(Node *node);
+
+static bool packable_list(Node *node) {
+  for (; node; node = node->next)
+    if (!packable(node))
+      return false;
+  return true;
+}
+
+static bool packable(Node *node) {
+  if (!node)
+    return true;
+  switch (node->kind) {
+  case ND_SWITCH:
+  case ND_CASE:
+  case ND_LABEL:
+  case ND_LABEL_VAL:
+    return false;
+  case ND_GOTO:
+    return !node->label;  // break and continue; a goto's label is resolved at the function's end
+  case ND_VAR:
+  case ND_VLA_PTR:
+  case ND_MEMZERO:
+  case ND_NUM:
+  case ND_ASM:
+  case ND_PACKED:
+    return true;
+  default:
+    if (node->kind > ND_PACKED)
+      return false;
+    break;
+  }
+  if (!packable(node->lhs) || !packable(node->rhs))
+    return false;
+  if (is_ctl_node(node))
+    return packable(node->cond) && packable(node->then) && packable(node->els) &&
+           packable(node->init) && packable(node->inc);
+  if (node->kind == ND_BLOCK || node->kind == ND_STMT_EXPR)
+    return packable_list(node->body);
+  if (node->kind == ND_FUNCALL)
+    return packable_list(node->args);
+  if (node->kind == ND_CAS)
+    return packable(node->cas_addr) && packable(node->cas_old) && packable(node->cas_new);
+  return true;
+}
+
+static void pk_node(Node *node);
+
+static void pk_list(Node *node) {
+  int n = 0;
+  for (Node *x = node; x; x = x->next)
+    n++;
+  pk_int(n);
+  for (; node; node = node->next)
+    pk_node(node);
+}
+
+static void pk_node(Node *node) {
+  if (!node) {
+    pk_byte(PK_NULL);
+    return;
+  }
+  Token *tok = pos_token(node->tok);
+  int b = node->kind;
+  if (node->ty == pk_ty)
+    b |= PK_SAME_TY;
+  if (tok == pk_tok)
+    b |= PK_SAME_TOK;
+  pk_byte(b);
+  if (!(b & PK_SAME_TY))
+    pk_ptr(pk_ty = node->ty);
+  if (!(b & PK_SAME_TOK))
+    pk_ptr(pk_tok = tok);
+
+  switch (node->kind) {
+  case ND_VAR:
+  case ND_VLA_PTR:
+  case ND_MEMZERO:
+    pk_ptr(node->var);
+    return;
+  case ND_NUM:
+    pk_int(node->val);
+    if (is_flonum(node->ty))
+      pk_bytes(&node->fval, sizeof(node->fval));
+    return;
+  case ND_ASM:
+    pk_ptr(node->asm_str);
+    return;
+  case ND_PACKED:
+    pk_ptr(node->packed);
+    return;
+  case ND_GOTO:
+    pk_ptr(node->unique_label);
+    return;
+  default:
+    break;
+  }
+  pk_node(node->lhs);
+  pk_node(node->rhs);
+  if (is_ctl_node(node)) {
+    pk_node(node->cond);
+    pk_node(node->then);
+    pk_node(node->els);
+    pk_node(node->init);
+    pk_node(node->inc);
+    pk_ptr(node->brk_label);
+    pk_ptr(node->cont_label);
+  } else if (node->kind == ND_BLOCK || node->kind == ND_STMT_EXPR) {
+    pk_list(node->body);
+  } else if (node->kind == ND_MEMBER) {
+    pk_ptr(node->member);
+  } else if (node->kind == ND_FUNCALL) {
+    pk_ptr(node->func_ty);
+    pk_list(node->args);
+    pk_ptr(node->ret_buffer);
+  } else if (node->kind == ND_CAS) {
+    pk_node(node->cas_addr);
+    pk_node(node->cas_old);
+    pk_node(node->cas_new);
+  }
+}
+
+static Node *new_packed(unsigned char *packed, Type *ty, Token *tok) {
+  Node *node = cc_node_calloc(offsetof(Node, packed) + sizeof(node->packed));
+  node->kind = ND_PACKED;
+  node->ty = ty;
+  node->tok = tok;
+  node->packed = packed;
+  return node;
+}
+
+static Node *unpk_node(void);
+
+static Node *unpk_list(void) {
+  Node head = {};
+  Node *cur = &head;
+  for (int64_t n = pk_rdint(); n > 0; n--)
+    cur = cur->next = unpk_node();
+  return head.next;
+}
+
+static Node *unpk_node(void) {
+  int b = *pk_in++;
+  if (b == PK_NULL)
+    return NULL;
+  NodeKind kind = b & 0x3F;
+  Type *ty = b & PK_SAME_TY ? pk_ty : (pk_ty = pk_rdptr());
+  Token *tok = b & PK_SAME_TOK ? pk_tok : (pk_tok = pk_rdptr());
+  if (kind == ND_PACKED)
+    return new_packed(pk_rdptr(), ty, tok);
+
+  Node *node = cc_node_calloc(sizeof(Node));
+  node->kind = kind;
+  node->ty = ty;
+  node->tok = tok;
+  switch (kind) {
+  case ND_VAR:
+  case ND_VLA_PTR:
+  case ND_MEMZERO:
+    node->var = pk_rdptr();
+    return node;
+  case ND_NUM:
+    node->val = pk_rdint();
+    if (is_flonum(ty)) {
+      memcpy(&node->fval, pk_in, sizeof(node->fval));
+      pk_in += sizeof(node->fval);
+    }
+    return node;
+  case ND_ASM:
+    node->asm_str = pk_rdptr();
+    return node;
+  case ND_GOTO:
+    node->unique_label = pk_rdptr();
+    return node;
+  default:
+    break;
+  }
+  node->lhs = unpk_node();
+  node->rhs = unpk_node();
+  if (is_ctl_node(node)) {
+    node->cond = unpk_node();
+    node->then = unpk_node();
+    node->els = unpk_node();
+    node->init = unpk_node();
+    node->inc = unpk_node();
+    node->brk_label = pk_rdptr();
+    node->cont_label = pk_rdptr();
+  } else if (kind == ND_BLOCK || kind == ND_STMT_EXPR) {
+    node->body = unpk_list();
+  } else if (kind == ND_MEMBER) {
+    node->member = pk_rdptr();
+  } else if (kind == ND_FUNCALL) {
+    node->func_ty = pk_rdptr();
+    node->args = unpk_list();
+    node->ret_buffer = pk_rdptr();
+  } else if (kind == ND_CAS) {
+    node->cas_addr = unpk_node();
+    node->cas_old = unpk_node();
+    node->cas_new = unpk_node();
+  }
+  return node;
+}
+
+Node *cc_unpack(Node *node) {
+  pk_in = node->packed;
+  pk_ty = NULL;
+  pk_tok = NULL;
+  return unpk_node();
+}
+
+// The statement node, parsed since m (nnodes Nodes then listed in batch_nodes, batch_gen then
+// gen), packed if it can be.
+static Node *pack_stmt(Node *node, CcFnMark m, int nnodes, int gen) {
+  add_type(node);
+  if (!body_batches || no_pack || fn_vla || node->kind == ND_PACKED || !packable(node))
+    return node;
+  pk_len = 0;
+  pk_ty = NULL;
+  pk_tok = NULL;
+  pk_node(node);
+  Type *ty = node->ty;
+  Token *tok = pos_token(node->tok);
+  unsigned char *packed = cc_fn_calloc(pk_len);
+  memcpy(packed, pk_buf, pk_len);
+  cc_node_release(m);
+  // A batch recycled inside the statement repointed and dropped the Nodes listed before it.
+  nbatch_nodes = gen == batch_gen ? nnodes : 0;
+  return new_packed(packed, ty, tok);
+}
+
+// stmt(), packed.
+static Node *packed_stmt(Token **rest, Token *tok) {
+  CcFnMark m = cc_fn_mark();
+  int nnodes = nbatch_nodes, gen = batch_gen;
+  return pack_stmt(stmt(rest, tok), m, nnodes, gen);
+}
+
 static bool is_end(Token *tok) {
+  next_batch(tok);
   return equal(tok, "}") || (equal(tok, ",") && equal(tok->next, "}"));
 }
 
 static bool consume_end(Token **rest, Token *tok) {
+  next_batch(tok);
   if (equal(tok, "}")) {
     *rest = tok->next;
     return true;
@@ -1165,11 +1594,9 @@ static void designation(Token **rest, Token *tok, Initializer *init) {
 // An array length can be omitted if an array has an initializer
 // (e.g. `int x[] = {1,2,3}`). If it's omitted, count the number
 // of initializer elements.
-// With drop (at the top level), each element's Nodes are dropped once it is counted.
-static int count_array_init_elements(Token *tok, Type *ty, bool drop) {
+static int count_array_init_elements(Token *tok, Type *ty) {
   bool first = true;
   Initializer *dummy = new_initializer(ty->base, true);
-  CcFnMark m = cc_fn_mark();
 
   int i = 0, max = 0;
 
@@ -1187,8 +1614,6 @@ static int count_array_init_elements(Token *tok, Type *ty, bool drop) {
     } else {
       initializer2(&tok, tok, dummy);
     }
-    if (drop)
-      cc_fn_release(m);
 
     i++;
     max = MAX(max, i);
@@ -1201,14 +1626,14 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
   tok = skip(tok, "{");
 
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty, false);
+    int len = count_array_init_elements(tok, init->ty);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
   bool first = true;
 
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty, false);
+    int len = count_array_init_elements(tok, init->ty);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
@@ -1239,7 +1664,7 @@ static void array_initializer1(Token **rest, Token *tok, Initializer *init) {
 // array-initializer2 = initializer ("," initializer)*
 static void array_initializer2(Token **rest, Token *tok, Initializer *init, int i) {
   if (init->is_flexible) {
-    int len = count_array_init_elements(tok, init->ty, false);
+    int len = count_array_init_elements(tok, init->ty);
     *init = *new_initializer(array_of(init->ty->base, len), false);
   }
 
@@ -1334,6 +1759,7 @@ static void union_initializer(Token **rest, Token *tok, Initializer *init) {
 //             | struct-initializer | union-initializer
 //             | assign
 static void initializer2(Token **rest, Token *tok, Initializer *init) {
+  check_stack(tok);
   if (init->ty->kind == TY_ARRAY && tok->kind == TK_STR) {
     string_initializer(rest, tok, init);
     return;
@@ -1582,54 +2008,98 @@ static Relocation *write_gvar_scalar(Relocation *cur, Node *expr, Type *ty, char
     return cur;
   }
 
+  if (!*label)
+    error_tok(expr->tok, "label address in a static initializer is not supported");
   Relocation *rel = calloc(1, sizeof(Relocation));
   rel->offset = offset;
-  rel->label = label;
+  rel->label = *label;  // the name itself: what it was read from may be dropped with expr
   rel->addend = val;
   cur->next = rel;
   return cur->next;
 }
 
-// Data tables (arrays, of arrays, of numbers or pointers: fonts, sprites, lookup and string
-// tables) are written straight into the data as each element is parsed, without an Initializer
-// or Node per element. Element by element it follows initializer2() and the functions it calls.
+// A global's initializer is written straight into its data as each element is parsed, without
+// an Initializer or a Node per element: at the top level each element's Nodes are dropped once
+// it is written, and the tokens of a long initializer as each batch of them is parsed (see
+// next_batch()), so a table of any length takes little more than its data. Element by element it
+// follows initializer2() and the functions it calls; a member is a bitfield where bf is given.
 typedef struct {
   char *buf;
-  Relocation *cur;
-  bool drop;  // at the top level: drop each element's Nodes once it is written
-} Table;
+  int cap;      // bytes in buf; an unsized array's grows (cc_grow())
+  Type *outer;  // the global's type: for an unsized array, with room for any number of elements
+  int len;      // elements of outer seen
+  int hi;       // bytes up to the end of the last one written
+  Relocation *head, *cur;
+  bool drop;    // at the top level: drop each element's Nodes once it is written
+} Data;
 
-static bool is_table(Type *ty) {
-  if (ty->kind != TY_ARRAY)
-    return false;
-  while (ty->kind == TY_ARRAY)
-    ty = ty->base;
-  return is_numeric(ty) || ty->kind == TY_PTR;
+// Where to write size bytes at offset.
+static char *data_at(Data *d, int offset, int size) {
+  if (offset + size > d->cap) {
+    int cap = MAX(d->cap * 2, offset + size + 256);
+    d->buf = cc_grow(d->buf, d->cap, cap);
+    d->cap = cap;
+  }
+  d->hi = MAX(d->hi, offset + size);
+  return d->buf + offset;
 }
 
-static void table_initializer2(Token **rest, Token *tok, Type *ty, Table *t, int offset);
+// An object initialized again (by a designator) loses what it had: its bytes and relocations.
+static void data_clear(Data *d, int offset, int size) {
+  if (offset >= d->hi)
+    return;
+  memset(d->buf + offset, 0, MIN(size, d->hi - offset));
+  Relocation *prev = d->head;
+  for (Relocation *r = prev->next; r; r = r->next) {
+    if (r->offset >= offset && r->offset < offset + size) {
+      prev->next = r->next;
+      if (d->cur == r)
+        d->cur = prev;
+    } else {
+      prev = r;
+    }
+  }
+}
 
-static void table_scalar(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+static Member *bitfield(Member *mem) {
+  return mem->is_bitfield ? mem : NULL;
+}
+
+static void data_initializer2(Token **rest, Token *tok, Type *ty, Data *d, int offset, Member *bf);
+
+static void data_scalar(Token **rest, Token *tok, Type *ty, Data *d, int offset, Member *bf) {
   CcFnMark m = cc_fn_mark();
+  int nnodes = nbatch_nodes;
   Node *expr = assign(rest, tok);
   add_type(expr);
-  t->cur = write_gvar_scalar(t->cur, expr, ty, t->buf, offset);
-  if (t->drop)
+  char *loc = data_at(d, offset, ty->size);
+  if (bf) {
+    uint64_t mask = (1L << bf->bit_width) - 1;
+    uint64_t oldval = read_buf(loc, ty->size) & ~(mask << bf->bit_offset);
+    write_buf(loc, oldval | ((eval(expr) & mask) << bf->bit_offset), ty->size);
+  } else {
+    data_clear(d, offset, ty->size);
+    d->cur = write_gvar_scalar(d->cur, expr, ty, d->buf, offset);
+  }
+  if (d->drop) {
     cc_fn_release(m);
+    nbatch_nodes = nnodes;
+  }
 }
 
-static void table_string(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+static void data_string(Token **rest, Token *tok, Type *ty, Data *d, int offset) {
   int sz = ty->base->size;
   if (sz != 1 && sz != 2 && sz != 4)
     unreachable();
   int len = MIN(ty->array_len, tok->ty->array_len);
+  char *p = data_at(d, offset, sz * len);
   for (int i = 0; i < len; i++)
-    write_buf(t->buf + offset + sz * i, read_buf(tok->str + sz * i, sz), sz);
+    write_buf(p + sz * i, read_buf(tok->str + sz * i, sz), sz);
   *rest = tok->next;
 }
 
 // Elements from the i'th on, without braces (array_initializer2).
-static void table_array2(Token **rest, Token *tok, Type *ty, Table *t, int offset, int i) {
+static void data_array2(Token **rest, Token *tok, Type *ty, Data *d, int offset, int i) {
   for (; i < ty->array_len && !is_end(tok); i++) {
     Token *start = tok;
     if (i > 0)
@@ -1640,12 +2110,32 @@ static void table_array2(Token **rest, Token *tok, Type *ty, Table *t, int offse
       return;
     }
 
-    table_initializer2(&tok, tok, ty->base, t, offset + ty->base->size * i);
+    data_initializer2(&tok, tok, ty->base, d, offset + ty->base->size * i, NULL);
   }
   *rest = tok;
 }
 
-static void table_designation(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+// Members from mem on, without braces (struct_initializer2); first unless after a designation.
+static void data_struct2(Token **rest, Token *tok, Type *ty, Data *d, int offset, Member *mem,
+                         bool first) {
+  for (; mem && !is_end(tok); mem = mem->next) {
+    Token *start = tok;
+    if (!first)
+      tok = skip(tok, ",");
+    first = false;
+
+    if (equal(tok, "[") || equal(tok, ".")) {
+      *rest = start;
+      return;
+    }
+
+    data_initializer2(&tok, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+  }
+  *rest = tok;
+}
+
+// designation = ("[" const-expr "]" | "." ident)* "="? initializer
+static void data_designation(Token **rest, Token *tok, Type *ty, Data *d, int offset, Member *bf) {
   if (equal(tok, "[")) {
     if (ty->kind != TY_ARRAY)
       error_tok(tok, "array index in non-array initializer");
@@ -1655,8 +2145,21 @@ static void table_designation(Token **rest, Token *tok, Type *ty, Table *t, int 
 
     Token *tok2;
     for (int i = begin; i <= end; i++)
-      table_designation(&tok2, tok, ty->base, t, offset + ty->base->size * i);
-    table_array2(rest, tok2, ty, t, offset, begin + 1);
+      data_designation(&tok2, tok, ty->base, d, offset + ty->base->size * i, NULL);
+    data_array2(rest, tok2, ty, d, offset, begin + 1);
+    return;
+  }
+
+  if (equal(tok, ".") && ty->kind == TY_STRUCT) {
+    Member *mem = struct_designator(&tok, tok, ty);
+    data_designation(&tok, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+    data_struct2(rest, tok, ty, d, offset, mem->next, false);
+    return;
+  }
+
+  if (equal(tok, ".") && ty->kind == TY_UNION) {
+    Member *mem = struct_designator(&tok, tok, ty);
+    data_designation(rest, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
     return;
   }
 
@@ -1665,11 +2168,11 @@ static void table_designation(Token **rest, Token *tok, Type *ty, Table *t, int 
 
   if (equal(tok, "="))
     tok = tok->next;
-  table_initializer2(rest, tok, ty, t, offset);
+  data_initializer2(rest, tok, ty, d, offset, bf);
 }
 
 // "{" elements "}" (array_initializer1).
-static void table_array1(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+static void data_array1(Token **rest, Token *tok, Type *ty, Data *d, int offset) {
   tok = skip(tok, "{");
   bool first = true;
 
@@ -1684,79 +2187,179 @@ static void table_array1(Token **rest, Token *tok, Type *ty, Table *t, int offse
 
       Token *tok2;
       for (int j = begin; j <= end; j++)
-        table_designation(&tok2, tok, ty->base, t, offset + ty->base->size * j);
+        data_designation(&tok2, tok, ty->base, d, offset + ty->base->size * j, NULL);
       tok = tok2;
       i = end;
+      if (ty == d->outer)
+        d->len = MAX(d->len, i + 1);
       continue;
     }
 
     if (i < ty->array_len)
-      table_initializer2(&tok, tok, ty->base, t, offset + ty->base->size * i);
+      data_initializer2(&tok, tok, ty->base, d, offset + ty->base->size * i, NULL);
     else
       tok = skip_excess_element(tok);
+    if (ty == d->outer)
+      d->len = MAX(d->len, i + 1);
   }
 }
 
-static void table_initializer2(Token **rest, Token *tok, Type *ty, Table *t, int offset) {
+// "{" members "}" (struct_initializer1).
+static void data_struct1(Token **rest, Token *tok, Type *ty, Data *d, int offset) {
+  tok = skip(tok, "{");
+
+  Member *mem = ty->members;
+  bool first = true;
+
+  while (!consume_end(rest, tok)) {
+    if (!first)
+      tok = skip(tok, ",");
+    first = false;
+
+    if (equal(tok, ".")) {
+      mem = struct_designator(&tok, tok, ty);
+      data_designation(&tok, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+      mem = mem->next;
+      continue;
+    }
+
+    if (mem) {
+      data_initializer2(&tok, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+      mem = mem->next;
+    } else {
+      tok = skip_excess_element(tok);
+    }
+  }
+}
+
+static void data_union(Token **rest, Token *tok, Type *ty, Data *d, int offset) {
+  data_clear(d, offset, ty->size);
+  if (equal(tok, "{") && equal(tok->next, ".")) {
+    Member *mem = struct_designator(&tok, tok->next, ty);
+    data_designation(&tok, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+    *rest = skip(tok, "}");
+    return;
+  }
+
+  Member *mem = ty->members;
+  if (!mem) {
+    *rest = skip(skip(tok, "{"), "}");
+    return;
+  }
+
+  if (equal(tok, "{")) {
+    data_initializer2(&tok, tok->next, mem->ty, d, offset + mem->offset, bitfield(mem));
+    next_batch(tok);
+    consume(&tok, tok, ",");
+    *rest = skip(tok, "}");
+  } else {
+    data_initializer2(rest, tok, mem->ty, d, offset + mem->offset, bitfield(mem));
+  }
+}
+
+static void data_initializer2(Token **rest, Token *tok, Type *ty, Data *d, int offset, Member *bf) {
+  // A string or a braced list sets all of what it initializes (unsized: up to the end).
+  if (ty->kind != TY_UNION && (equal(tok, "{") || tok->kind == TK_STR))
+    data_clear(d, offset, ty->size < 0 ? INT_MAX - offset : ty->size);
+
   if (ty->kind == TY_ARRAY) {
-    if (tok->kind == TK_STR)
-      table_string(rest, tok, ty, t, offset);
+    // A string initializes an array of characters; in an array of those, its first one.
+    if (tok->kind == TK_STR && is_integer(ty->base))
+      data_string(rest, tok, ty, d, offset);
     else if (equal(tok, "{"))
-      table_array1(rest, tok, ty, t, offset);
+      data_array1(rest, tok, ty, d, offset);
     else
-      table_array2(rest, tok, ty, t, offset, 0);
+      data_array2(rest, tok, ty, d, offset, 0);
+    return;
+  }
+
+  if (ty->kind == TY_STRUCT) {
+    if (equal(tok, "{")) {
+      data_struct1(rest, tok, ty, d, offset);
+      return;
+    }
+
+    // Another struct (`struct T x = y;`) leaves it zero, as write_gvar_data() did.
+    CcFnMark m = cc_fn_mark();
+    int nnodes = nbatch_nodes;
+    Node *expr = assign(rest, tok);
+    add_type(expr);
+    bool is_struct = expr->ty->kind == TY_STRUCT;
+    if (d->drop) {
+      cc_fn_release(m);
+      nbatch_nodes = nnodes;
+    }
+    if (!is_struct)
+      data_struct2(rest, tok, ty, d, offset, ty->members, true);
+    return;
+  }
+
+  if (ty->kind == TY_UNION) {
+    data_union(rest, tok, ty, d, offset);
     return;
   }
 
   if (equal(tok, "{")) {
     // A scalar in braces.
-    table_initializer2(&tok, tok->next, ty, t, offset);
+    data_initializer2(&tok, tok->next, ty, d, offset, bf);
     *rest = skip(tok, "}");
     return;
   }
 
-  table_scalar(rest, tok, ty, t, offset);
+  data_scalar(rest, tok, ty, d, offset, bf);
 }
 
-static void table_initializer(Token **rest, Token *tok, Obj *var, bool drop) {
-  Type *ty = var->ty;
-  if (ty->size < 0) {
-    int len = tok->kind == TK_STR ? tok->ty->array_len : count_array_init_elements(tok->next, ty, drop);
-    ty = array_of(ty->base, len);
-  }
-  var->ty = keep_type(ty);
-
-  Table t = {calloc(1, var->ty->size), NULL, drop};
-  Relocation head = {};
-  t.cur = &head;
-  table_initializer2(rest, tok, var->ty, &t, 0);
-  var->init_data = t.buf;
-  var->rel = head.next;
-}
-
-// Initializers for global variables are evaluated at compile-time and
-// embedded to .data section. This function serializes Initializer
-// objects to a flat byte array. It is a compile error if an
-// initializer list contains a non-constant expression.
-// What survives is the data and its relocations (and the type); at the top level, the Initializer
-// tree and the Nodes (one per element of a table) go in the function arena and are dropped.
+// Initializers for global variables are evaluated at compile-time and embedded to .data
+// section, with relocations for addresses. It is a compile error if an initializer list contains
+// a non-constant expression. Only a struct with a flexible array member still goes through an
+// Initializer tree (write_gvar_data()); at the top level that and its Nodes go in the function
+// arena and are dropped.
 static void gvar_initializer(Token **rest, Token *tok, Obj *var) {
   bool own = !cc_fn_is_open();
   if (own)
     cc_fn_begin();
-  if (is_table(var->ty) && (equal(tok, "{") || tok->kind == TK_STR)) {
-    table_initializer(rest, tok, var, own);
-    if (own)
-      cc_fn_end();
-    return;
-  }
-  Initializer *init = initializer(rest, tok, var->ty, &var->ty);
-  var->ty = keep_type(var->ty);
-
+  Type *ty = var->ty;
   Relocation head = {};
-  char *buf = calloc(1, var->ty->size);
-  write_gvar_data(&head, init, var->ty, buf, 0);
-  var->init_data = buf;
+
+  bool tree = ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && ty->is_flexible) ||
+              (ty->size < 0 && !equal(tok, "{") && tok->kind != TK_STR);
+  if (tree) {
+    bool was = init_drop;
+    init_drop = false;  // its Nodes point at the tokens
+    Initializer *init = initializer(rest, tok, ty, &var->ty);
+    init_drop = was;
+    var->ty = keep_type(var->ty);
+
+    char *buf = calloc(1, var->ty->size);
+    write_gvar_data(&head, init, var->ty, buf, 0);
+    var->init_data = buf;
+  } else {
+    bool unsized = ty->size < 0;
+    int str_len = tok->kind == TK_STR ? tok->ty->array_len : -1;  // tok may be recycled by then
+    Data d = {.head = &head, .cur = &head, .drop = own};
+    if (unsized) {
+      d.outer = array_of(ty->base, INT_MAX / MAX(ty->base->size, 1));
+    } else {
+      d.outer = ty;
+      d.cap = ty->size;
+      d.buf = calloc(1, d.cap);
+    }
+
+    bool was = init_drop;
+    init_drop = own;
+    data_initializer2(rest, tok, d.outer, &d, 0, NULL);
+    init_drop = was;
+
+    if (unsized) {
+      ty = array_of(ty->base, str_len >= 0 ? str_len : d.len);
+      char *buf = calloc(1, ty->size);
+      memcpy(buf, d.buf, MIN(d.cap, ty->size));
+      cc_grow_free(d.buf);
+      d.buf = buf;
+    }
+    var->ty = keep_type(ty);
+    var->init_data = d.buf;
+  }
   var->rel = head.next;
   if (own)
     cc_fn_end();
@@ -1814,6 +2417,7 @@ static Node *asm_stmt(Token **rest, Token *tok) {
 //      | "{" compound-stmt
 //      | expr-stmt
 static Node *stmt(Token **rest, Token *tok) {
+  check_stack(tok);
   if (equal(tok, "return")) {
     Node *node = new_node(ND_RETURN, tok);
     if (consume(rest, tok->next, ";"))
@@ -1837,7 +2441,7 @@ static Node *stmt(Token **rest, Token *tok) {
     node->cond = expr(&tok, tok);
     tok = skip(tok, ")");
     node->then = stmt(&tok, tok);
-    if (equal(tok, "else"))
+    if (equal(stmt_batch(tok), "else"))
       node->els = stmt(&tok, tok->next);
     *rest = tok;
     return node;
@@ -1881,7 +2485,7 @@ static Node *stmt(Token **rest, Token *tok) {
 
     tok = skip(tok, ":");
     node->label = new_unique_name();
-    node->lhs = stmt(rest, tok);
+    node->lhs = packed_stmt(rest, tok);
     node->begin = begin;
     node->end = end;
     node->case_next = current_switch->cases;
@@ -1896,7 +2500,7 @@ static Node *stmt(Token **rest, Token *tok) {
     Node *node = new_node(ND_CASE, tok);
     tok = skip(tok->next, ":");
     node->label = new_unique_name();
-    node->lhs = stmt(rest, tok);
+    node->lhs = packed_stmt(rest, tok);
     current_switch->default_case = node;
     return node;
   }
@@ -1966,7 +2570,7 @@ static Node *stmt(Token **rest, Token *tok) {
     brk_label = brk;
     cont_label = cont;
 
-    tok = skip(tok, "while");
+    tok = skip(stmt_batch(tok), "while");
     tok = skip(tok, "(");
     node->cond = expr(&tok, tok);
     tok = skip(tok, ")");
@@ -1986,7 +2590,7 @@ static Node *stmt(Token **rest, Token *tok) {
       return node;
     }
 
-    Node *node = new_node(ND_GOTO, tok);
+    Node *node = new_node(ND_GOTO, tok->next);  // the label: see resolve_goto_labels()
     node->label = get_ident(tok->next);
     node->goto_next = gotos;
     gotos = node;
@@ -2016,7 +2620,7 @@ static Node *stmt(Token **rest, Token *tok) {
     Node *node = new_node(ND_LABEL, tok);
     node->label = strndup(tok->loc, tok->len);
     node->unique_label = new_unique_name();
-    node->lhs = stmt(rest, tok->next->next);
+    node->lhs = packed_stmt(rest, tok->next->next);
     node->goto_next = labels;
     labels = node;
     return node;
@@ -2036,7 +2640,9 @@ static Node *compound_stmt(Token **rest, Token *tok) {
 
   enter_scope();
 
-  while (!equal(tok, "}")) {
+  while (!equal(tok = stmt_batch(tok), "}")) {
+    CcFnMark m = cc_fn_mark();
+    int nnodes = nbatch_nodes, gen = batch_gen;
     if (equal(tok, "_Static_assert")) {
       tok = static_assertion(tok);
       continue;
@@ -2060,11 +2666,10 @@ static Node *compound_stmt(Token **rest, Token *tok) {
         continue;
       }
 
-      cur = cur->next = declaration(&tok, tok, basety, &attr);
+      cur = cur->next = pack_stmt(declaration(&tok, tok, basety, &attr), m, nnodes, gen);
     } else {
-      cur = cur->next = stmt(&tok, tok);
+      cur = cur->next = pack_stmt(stmt(&tok, tok), m, nnodes, gen);
     }
-    add_type(cur);
   }
 
   leave_scope();
@@ -2120,7 +2725,7 @@ static int64_t eval2(Node *node, char ***label) {
     switch (node->ty->size) {
     case 1: return node->ty->is_unsigned ? (uint8_t)val : (int8_t)val;
     case 2: return node->ty->is_unsigned ? (uint16_t)val : (int16_t)val;
-    case 4: return node->ty->is_unsigned ? (uint32_t)val : (int32_t)val;
+    case 4: return node->ty->is_unsigned ? (int64_t)(uint32_t)val : (int64_t)(int32_t)val;
     }
   }
   return val;
@@ -2191,7 +2796,7 @@ static int64_t eval3(Node *node, char ***label) {
       switch (node->ty->size) {
       case 1: return node->ty->is_unsigned ? (uint8_t)val : (int8_t)val;
       case 2: return node->ty->is_unsigned ? (uint16_t)val : (int16_t)val;
-      case 4: return node->ty->is_unsigned ? (uint32_t)val : (int32_t)val;
+      case 4: return node->ty->is_unsigned ? (int64_t)(uint32_t)val : (int64_t)(int32_t)val;
       }
     }
     return val;
@@ -2213,7 +2818,7 @@ static int64_t eval3(Node *node, char ***label) {
     if (node->var->ty->kind != TY_ARRAY && node->var->ty->kind != TY_FUNC)
       error_tok(node->tok, "invalid initializer");
     *label = &node->var->name;
-    return 0;
+    return node->var->offset;  // a string literal's place in .data (codegen_string())
   case ND_NUM:
     return node->val;
   }
@@ -2227,7 +2832,7 @@ static int64_t eval_rval(Node *node, char ***label) {
     if (node->var->is_local)
       error_tok(node->tok, "not a compile-time constant");
     *label = &node->var->name;
-    return 0;
+    return node->var->offset;
   case ND_DEREF:
     return eval2(node->lhs, label);
   case ND_MEMBER:
@@ -2276,8 +2881,13 @@ static bool is_const_expr(Node *node) {
 }
 
 int64_t const_expr(Token **rest, Token *tok) {
-  Node *node = conditional(rest, tok);
-  return eval(node);
+  // The expression's Nodes are dropped once evaluated (a switch can have hundreds of cases).
+  CcFnMark m = cc_fn_mark();
+  int nnodes = nbatch_nodes, gen = batch_gen;
+  int64_t val = eval(conditional(rest, tok));
+  cc_node_release(m);
+  nbatch_nodes = gen == batch_gen ? nnodes : 0;
+  return val;
 }
 
 static double eval_double(Node *node) {
@@ -2783,6 +3393,7 @@ static Node *cast(Token **rest, Token *tok) {
 //       | "&&" ident
 //       | postfix
 static Node *unary(Token **rest, Token *tok) {
+  check_stack(tok);
   if (equal(tok, "+"))
     return cast(rest, tok->next);
 
@@ -2825,7 +3436,7 @@ static Node *unary(Token **rest, Token *tok) {
 
   // [GNU] labels-as-values
   if (equal(tok, "&&")) {
-    Node *node = new_node(ND_LABEL_VAL, tok);
+    Node *node = new_node(ND_LABEL_VAL, tok->next);  // the label: see resolve_goto_labels()
     node->label = get_ident(tok->next);
     node->goto_next = gotos;
     gotos = node;
@@ -3183,7 +3794,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     error_tok(fn->tok, "not a function");
 
   Type *ty = (fn->ty->kind == TY_FUNC) ? fn->ty : fn->ty->base;
-  Type *param_ty = ty->params;
+  Type **param_ty = ty->params;
 
   Node head = {};
   Node *cur = &head;
@@ -3195,13 +3806,13 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     Node *arg = assign(&tok, tok);
     add_type(arg);
 
-    if (!param_ty && !ty->is_variadic)
+    if (!(param_ty && *param_ty) && !ty->is_variadic)
       error_tok(tok, "too many arguments");
 
-    if (param_ty) {
-      if (param_ty->kind != TY_STRUCT && param_ty->kind != TY_UNION)
-        arg = implicit_cast(arg, param_ty);
-      param_ty = param_ty->next;
+    if (param_ty && *param_ty) {
+      if ((*param_ty)->kind != TY_STRUCT && (*param_ty)->kind != TY_UNION)
+        arg = implicit_cast(arg, *param_ty);
+      param_ty++;
     } else if (arg->ty->kind == TY_FLOAT) {
       // If parameter type is omitted (e.g. in "..."), float
       // arguments are promoted to double.
@@ -3211,7 +3822,7 @@ static Node *funcall(Token **rest, Token *tok, Node *fn) {
     cur = cur->next = arg;
   }
 
-  if (param_ty)
+  if (param_ty && *param_ty)
     error_tok(tok, "too few arguments");
 
   *rest = skip(tok, ")");
@@ -3289,7 +3900,9 @@ static Node *primary(Token **rest, Token *tok) {
   if (equal(tok, "(") && equal(tok->next, "{")) {
     // This is a GNU statement expresssion.
     Node *node = new_node(ND_STMT_EXPR, tok);
+    no_pack++;
     node->body = compound_stmt(&tok, tok->next->next)->body;
+    no_pack--;
     *rest = skip(tok, ")");
     return node;
   }
@@ -3455,12 +4068,17 @@ static Token *parse_typedef(Token *tok, Type *basety) {
   return tok;
 }
 
-static void create_param_lvars(Type *param) {
-  if (param) {
-    create_param_lvars(param->next);
-    if (!param->name)
-      error_tok(param->name_pos, "parameter name omitted");
-    new_lvar(get_ident(param->name), param);
+static void create_param_lvars(Type *ty, Token *tok) {
+  int n = 0;
+  while (ty->params && ty->params[n])
+    n++;
+  if (n && ty != names_ty)
+    error_tok(tok, "parameter name omitted");
+  for (int i = n - 1; i >= 0; i--) {
+    Param *p = &param_stack[names_base + i];
+    if (!p->name)
+      error_tok(p->pos, "parameter name omitted");
+    new_lvar(get_ident(p->name), p->ty);
   }
 }
 
@@ -3479,7 +4097,7 @@ static void resolve_goto_labels(void) {
     }
 
     if (x->unique_label == NULL)
-      error_tok(x->tok->next, "use of undeclared label");
+      error_tok(x->tok, "use of undeclared label");
   }
 
   gotos = labels = NULL;
@@ -3544,7 +4162,7 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   current_fn = fn;
   locals = NULL;
   enter_scope();
-  create_param_lvars(ty->params);
+  create_param_lvars(ty, tok);
 
   // A buffer for a struct/union return value is passed
   // as the hidden first parameter.
@@ -3562,7 +4180,13 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
   tok = skip(tok, "{");
 
   func_name = NULL;
+  body_batches = fn->is_root;
+  nbatch_nodes = 0;
+  memset(pos_cache, 0, sizeof(pos_cache));
+  fn_vla = false;
   fn->body = compound_stmt(&tok, tok);
+  body_batches = false;
+  nbatch_nodes = 0;
   fn->locals = locals;
   leave_scope();
   resolve_goto_labels();
@@ -3644,7 +4268,8 @@ static void scan_globals(void) {
 
 static void declare_builtin_functions(void) {
   Type *ty = func_type(pointer_to(ty_void));
-  ty->params = copy_type(ty_int);
+  ty->params = calloc(2, sizeof(Type *));
+  ty->params[0] = ty_int;
   builtin_alloca = new_gvar("alloca", ty);
   builtin_alloca->is_definition = false;
 }
@@ -3656,11 +4281,11 @@ Obj *parse(Token *tok) {
 
   // The preprocessor hands over one top-level declaration at a time, ending each with a TK_MORE
   // token; once it is parsed (and, for a function, compiled) its tokens are recycled.
-  for (Token *start = tok;;) {
+  for (decl_start = tok;;) {
     if (tok->kind == TK_MORE) {
-      preprocess_release(start, tok, keep_decl);
+      preprocess_release(decl_start, tok, keep_decl);
       keep_decl = false;
-      start = tok = preprocess_more(tok);
+      decl_start = tok = preprocess_more(tok);
     }
     if (tok->kind == TK_EOF)
       break;

@@ -77,12 +77,13 @@ bool is_compatible(Type *t1, Type *t2) {
     if (t1->is_variadic != t2->is_variadic)
       return false;
 
-    Type *p1 = t1->params;
-    Type *p2 = t2->params;
-    for (; p1 && p2; p1 = p1->next, p2 = p2->next)
-      if (!is_compatible(p1, p2))
+    Type *none = NULL;
+    Type **p1 = t1->params ? t1->params : &none;
+    Type **p2 = t2->params ? t2->params : &none;
+    for (; *p1 && *p2; p1++, p2++)
+      if (!is_compatible(*p1, *p2))
         return false;
-    return p1 == NULL && p2 == NULL;
+    return !*p1 && !*p2;
   }
   case TY_ARRAY:
     if (!is_compatible(t1->base, t2->base))
@@ -100,6 +101,27 @@ Type *copy_type(Type *ty) {
   return ret;
 }
 
+// A function type's parameter list as keep_type() keeps it.
+static Type **keep_params(Type **params) {
+  if (!params)
+    return NULL;
+  int n = 0;
+  while (params[n])
+    n++;
+  Type **p = params;
+  for (int i = 0; i < n; i++) {
+    Type *k = keep_type(params[i]);
+    if (p == params && (k != params[i] || cc_in_fn_arena(params))) {
+      bool was = cc_fn_types(false);
+      p = calloc(n + 1, sizeof(Type *));
+      cc_fn_types(was);
+      memcpy(p, params, sizeof(Type *) * n);
+    }
+    p[i] = k;
+  }
+  return p;
+}
+
 // ty, or a copy in the main arena if it (or a type it is made of) is in the function arena: for
 // a global (a static local, a string literal) that outlives the function.
 Type *keep_type(Type *ty) {
@@ -108,8 +130,9 @@ Type *keep_type(Type *ty) {
   bool in_fn = cc_in_fn_arena(ty);
   Type *base = keep_type(ty->base), *origin = keep_type(ty->origin);
   Type *ret_ty = ty->kind == TY_FUNC ? keep_type(ty->return_ty) : NULL;
+  Type **params = ty->kind == TY_FUNC ? keep_params(ty->params) : NULL;
   if (!in_fn && base == ty->base && origin == ty->origin &&
-      (ty->kind != TY_FUNC || ret_ty == ty->return_ty))
+      (ty->kind != TY_FUNC || (ret_ty == ty->return_ty && params == ty->params)))
     return ty;
 
   bool was = cc_fn_types(false);
@@ -117,17 +140,9 @@ Type *keep_type(Type *ty) {
   *t = *ty;
   t->base = base;
   t->origin = origin;
-  t->next = NULL;
   if (ty->kind == TY_FUNC) {
     t->return_ty = ret_ty;
-    Type head = {}, *cur = &head;
-    for (Type *p = ty->params; p; p = p->next) {
-      cur = cur->next = calloc(1, sizeof(Type));
-      Type *k = keep_type(p);
-      *cur = *k;
-      cur->next = NULL;
-    }
-    t->params = head.next;
+    t->params = params;
   } else if (ty->kind == TY_VLA) {
     t->vla_len = NULL;
     t->vla_size = NULL;
@@ -145,10 +160,23 @@ Type *keep_type(Type *ty) {
   return t;
 }
 
+// Pointer types are never changed once made (a declarator's name on one is read at once), so
+// pointer_to() hands out one per base where it can: the headers alone ask for hundreds. Only types
+// that last the whole compile go in, as a function arena's addresses come back for other types.
+#define PTR_CACHE 64
+static Type *ptr_cache[PTR_CACHE];
+
+void type_reset(void) { memset(ptr_cache, 0, sizeof ptr_cache); }
+
 Type *pointer_to(Type *base) {
+  Type **slot = &ptr_cache[((uintptr_t)base >> 3) % PTR_CACHE];
+  if (*slot && (*slot)->base == base)
+    return *slot;
   Type *ty = new_type(TY_PTR, 4, 4);
   ty->base = base;
   ty->is_unsigned = true;
+  if (!cc_in_fn_arena(ty) && !cc_in_fn_arena(base))
+    *slot = ty;
   return ty;
 }
 

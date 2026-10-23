@@ -1,5 +1,6 @@
 // module.cpp - .pcx loader: code in the ota_0 tail (mapped as instructions), data in RAM.
 // The technique is the one firmware/spikes/spike_p0 validated on the device.
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include <string.h>
 #include <stdio.h>
 #include "esp_partition.h"
@@ -215,3 +216,5 @@ bool rt_module_crash_where(char *buf, size_t n) {
   free(img);
   return found;
 }
+
+#endif  // ESP_PLATFORM

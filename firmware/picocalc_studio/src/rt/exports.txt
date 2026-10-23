@@ -175,3 +175,18 @@ __ashldi3
 __ashrdi3
 __lshrdi3
 __muldi3
+
+# libgcc: soft float, for programs compiled with cc_soft_float (the RP2350). `?` = weak: an
+# ilp32f libgcc lacks some of them, and a missing one reads as not exported.
+?__addsf3
+?__subsf3
+?__mulsf3
+?__divsf3
+?__eqsf2
+?__nesf2
+?__ltsf2
+?__lesf2
+?__fixsfsi
+?__fixunssfsi
+?__floatsisf
+?__floatunsisf

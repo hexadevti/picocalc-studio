@@ -1,5 +1,6 @@
 // system.cpp - boot order, timing, memory, SD card, crash breadcrumbs and the PicoMultiLoader
 // hand-off on the P4. From emu16 / pico-386 (system_p4.cpp).
+#ifdef ESP_PLATFORM   // the RP2350 build has its own (src/hal/picocalc_rp2350)
 #include "../../../board.h"
 #include <Arduino.h>
 #include <SPI.h>
@@ -214,3 +215,5 @@ void hal_init() {
   if (board) sdInit();
   p4InputInit();
 }
+
+#endif  // ESP_PLATFORM

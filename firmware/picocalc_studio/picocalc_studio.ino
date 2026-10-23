@@ -11,7 +11,12 @@
 #include "src/ide/ide.h"
 #include "src/export/export.h"
 
+#ifdef ESP_PLATFORM
 SET_LOOP_TASK_STACK_SIZE(32 * 1024);
+#else
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#endif
 
 static char s_where[160], s_why[320];
 
@@ -44,15 +49,32 @@ static bool showCrash() {
   return inProgram;
 }
 
-void setup() {
-  hal_init();
-  sdk_init();
-  rt_selftest_install();
-  const bool crashed = showCrash();
+static void appMain() {
+  hal_init();
+  sdk_init();
+  rt_selftest_install();
+  const bool crashed = showCrash();
   hal_breadcrumb(rt_has_native_app() ? "native app" : ex_is_app() ? "exported app" : "ide");
   if (rt_has_native_app()) rt_run_native_app();
   if (ex_is_app()) ex_run_app();   // an exported program (F5): never the IDE
   ide_run(crashed ? s_where : nullptr, crashed ? s_why : nullptr);
 }
 
+#ifdef ESP_PLATFORM
+void setup() { appMain(); }
 void loop() {}
+#else
+// arduino-pico runs setup() on a 4 KB task: the app gets a task of its own.
+static void appTask(void *) {
+  appMain();
+  vTaskDelete(nullptr);
+}
+void setup() {
+  Serial1.setTX(0);
+  Serial1.setRX(1);
+  Serial1.begin(115200);
+  if (xTaskCreatePinnedToCore(appTask, "app", 32 * 1024, nullptr, 1, nullptr, 0) != pdPASS)
+    Serial1.println("boot: app task create FAILED");
+}
+void loop() { delay(1000); }
+#endif

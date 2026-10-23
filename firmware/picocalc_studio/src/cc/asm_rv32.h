@@ -19,6 +19,7 @@ enum { FT0 = 0, FT1 = 1, FA0 = 10 };
 
 // Section helpers
 void sect_append(CcSection *s, const void *data, uint32_t n);
+CcReloc *cc_new_reloc(CcObject *o);  // a slot for one more relocation
 void sect_align(CcSection *s, uint32_t align);
 
 // Begins emitting into obj's text section (call once per object).

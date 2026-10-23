@@ -3,6 +3,7 @@
 // the menu from anywhere.
 #include <setjmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <dirent.h>
@@ -127,7 +128,9 @@ static void pageKeys() {
 // ---- 3. sound ----
 
 static void pageSound() {
-  static int16_t buf[2205];          // 50 ms at 44.1 kHz
+  // 50 ms at 44.1 kHz. On the heap, not static: a build of a big program needs that RAM.
+  int16_t *buf = (int16_t *)malloc(2205 * sizeof *buf);
+  if (!buf) return;
   int vol = 7;
   for (;;) {
     title("Sound");
@@ -139,7 +142,7 @@ static void pageSound() {
     footer("Esc: back");
     gfx_flush();
     int k = kbd_wait();
-    if (k == KEY_ESC) { snd_stop(); return; }
+    if (k == KEY_ESC) { snd_stop(); free(buf); return; }
     if (k == '-' && vol > 0) snd_volume(--vol);
     if ((k == '+' || k == '=') && vol < 10) snd_volume(++vol);
     if (k == '1') {

@@ -1,5 +1,7 @@
 // sys.cpp - picocalc.h sys_*, SDK start-up / reset and the program exit path.
 #include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include "picocalc.h"

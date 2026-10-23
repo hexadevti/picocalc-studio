@@ -43,6 +43,16 @@ uint8_t *rt_build(const char *const *paths, int n, size_t *size);
 // rt_build() on a temporary 64 KB task: the compiler recurses deeply. Blocks the caller.
 uint8_t *rt_build_big(const char *const *paths, int n, size_t *size);
 
+// Memory around the last rt_build_big(), in bytes. valid is false where it isn't measured (with
+// PSRAM, the build has room to spare).
+struct RtBuildMemory {
+  bool valid;
+  size_t heapBefore, heapParked, largestParked;  // heap free before, and after parking the docs
+  size_t compilerPeak, lentPeak, lentSize;       // lent: the borrowed framebuffer
+  size_t heapAfter, largestAfter;                // docs back and the image held
+};
+const RtBuildMemory *rt_build_memory();
+
 // The .c files of a project directory, sorted, as strdup'ed full paths. Returns the count.
 int rt_list_sources(const char *dir, char **files, int max);
 

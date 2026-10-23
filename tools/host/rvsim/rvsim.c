@@ -773,6 +773,8 @@ static int32_t do_ecall(void)
 /* ------------------------------------------------------------------------------------------ */
 /* Interpreter                                                                                */
 
+static int no_f;
+
 static void illegal(uint32_t inst, int len)
 {
     if (len == 2) die(132, "illegal instruction 0x%04x (compressed)", inst);
@@ -796,6 +798,11 @@ static void run(void)
             inst = cexp[lo];
             len = 2;
             if (!inst) illegal(raw, 2);
+        }
+        if (no_f) {                       /* RVSIM_NO_F=1: an RV32IMAC core (RP2350 Hazard3) */
+            uint32_t op = inst & 0x7f;
+            if (op == 0x07 || op == 0x27 || op == 0x43 || op == 0x47 || op == 0x4b || op == 0x4f || op == 0x53)
+                illegal(raw, len);
         }
         npc = pc + len;
         if (__builtin_expect(++instret > limit, 0))
@@ -1152,6 +1159,7 @@ int main(int argc, char **argv)
 {
     const char *sd = NULL;
     int i;
+    no_f = getenv("RVSIM_NO_F") && *getenv("RVSIM_NO_F") == '1';
     for (i = 1; i < argc && argv[i][0] == '-' && argv[i][1] == '-'; i++) {
         if (!strcmp(argv[i], "--trace")) trace = 1;
         else if (!strcmp(argv[i], "--stats")) stats = 1;

@@ -333,6 +333,8 @@ bool ed_key(Doc *d, int key, int rows) {
     return move(d, k, ctrl, rows);
   }
 
+  if (d->readOnly && !(ctrl && (k == 'a' || k == 'c'))) return false;   // only select and copy
+
   const DocLine *l = &d->ln[d->cy];
   if (ctrl) {
     switch (k) {

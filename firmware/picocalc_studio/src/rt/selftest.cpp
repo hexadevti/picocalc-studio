@@ -11,6 +11,7 @@
 #include <string.h>
 #include <strings.h>
 #include <dirent.h>
+#include "../../board.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
@@ -22,7 +23,11 @@
 
 #define TESTS_DIR "/sd/pico-dev/tests"
 #define INCLUDE_DIR "/sd/pico-dev/include"
+#ifdef CC_BORROW_FRAMEBUFFER
+#define MAX_OUTPUT (8 * 1024)   // no PSRAM: 64 KB in one piece is rarely free after a build
+#else
 #define MAX_OUTPUT (64 * 1024)
+#endif
 #define TEST_TIMEOUT_MS 20000
 
 static TaskHandle_t s_task;
@@ -96,7 +101,13 @@ static int listSources(const char *dir, char ***out) {
   return n;
 }
 
+#ifdef CC_BORROW_FRAMEBUFFER
+// No PSRAM: builds borrow the framebuffer, so the suite runs while the IDE waits (rt_service).
+static volatile bool s_pending;
+static uint8_t *build(const char *path, size_t *size) { return rt_build_big(&path, 1, size); }
+#else
 static uint8_t *build(const char *path, size_t *size) { return rt_build(&path, 1, size); }
+#endif
 
 // ---- unit tests ----
 
@@ -129,7 +140,14 @@ static void unitTest(const char *name) {
   const int rc = r.end == RT_END_RETURN || r.end == RT_END_EXIT ? r.status : -1;
   cap.buf[cap.len] = 0;
 
-  char *want = readFile(exp, nullptr);
+  char *want = nullptr;
+#ifdef CC_BORROW_FRAMEBUFFER
+  // No PSRAM: a test whose output depends on it has a <name>.nopsram.expected.
+  char alt[176];
+  snprintf(alt, sizeof alt, "%.*s.nopsram.expected", (int)(strlen(path) - 2), path);
+  want = readFile(alt, nullptr);
+#endif
+  if (!want) want = readFile(exp, nullptr);
   if (want) stripCr(want);
   bool ok = false;
   if (!want) report("FAIL %s: no %s", name, exp);
@@ -170,11 +188,13 @@ static int expandSeq(const char *p, const char *end, char out[][64], int max) {
       char sub[16][64];
       int k = expandAlts(p + 1, q - 1, sub, 16);
       int m = 0;
-      static char next[32][64];
+      char (*next)[64] = (char (*)[64])malloc(32 * 64);   // not static: builds need the RAM
+      if (!next) return n;
       for (int i = 0; i < n; i++)
         for (int j = 0; j < k && m < 32; j++) snprintf(next[m++], 64, "%s%s", out[i], sub[j]);
       n = m < max ? m : max;
       for (int i = 0; i < n; i++) strcpy(out[i], next[i]);
+      free(next);
       p = q;
     } else {
       for (int i = 0; i < n; i++) {
@@ -248,7 +268,7 @@ static void errorTest(const char *name) {
 
 // ---- task ----
 
-static void testTask(void *) {
+static void runSuite() {
   s_pass = s_fail = 0;
   size_t heap0 = heap_caps_get_free_size(MALLOC_CAP_8BIT);
   uint32_t t0 = hal_millis();
@@ -274,8 +294,23 @@ static void testTask(void *) {
          (unsigned)(heap0 >> 10));
   if (s_report) fclose(s_report);
   s_report = nullptr;
+}
+
+static void testTask(void *) {
+  runSuite();
   s_task = nullptr;
   vTaskDelete(nullptr);
+}
+
+bool rt_selftest_service() {
+#ifdef CC_BORROW_FRAMEBUFFER
+  if (!s_pending) return false;
+  runSuite();
+  s_pending = false;
+  return true;
+#else
+  return false;
+#endif
 }
 
 static bool onSerialCmd(const char *line) {
@@ -284,6 +319,13 @@ static bool onSerialCmd(const char *line) {
   if (s_task) { hal_log("@test is already running"); return true; }
   const char *f = line + 5;
   while (*f == ' ') f++;
+#ifdef CC_BORROW_FRAMEBUFFER
+  if (s_pending) { hal_log("@test is already running"); return true; }
+  snprintf(s_filter, sizeof s_filter, "%s", f);
+  s_pending = true;
+  hal_log("@test: queued (runs when the IDE or demo menu is idle)");
+  return true;
+#endif
   snprintf(s_filter, sizeof s_filter, "%s", f);
   // The compiler recurses deeply and the tests have big frames: a large stack, in internal RAM
   // (flash writes disable the cache, so it can't live in PSRAM). Core 1, away from the idle-task
