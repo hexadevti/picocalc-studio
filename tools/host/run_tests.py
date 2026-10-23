@@ -13,7 +13,7 @@ Modes
           (Validates the tests themselves; the same headers are later checked against pcc.)
   simref  Build every tests/unit/*.c with riscv32-esp-elf-gcc (-O1, rv32imafc/ilp32f, the real
           ESP newlib), link it with simfw and run it under rvsim (tools/host/rvsim); stdout must
-          match .expected byte for byte. TEST_DIR keeps its device default (/sd/pico-dev/tests/tmp_t18),
+          match .expected byte for byte. TEST_DIR keeps its device default (/sd/picocalc-studio/tests/tmp_t18),
           served from a temporary --sd directory. Builds rvsim/simfw first if out of date.
   pcc     Run the PicoCalc compiler on every test: --pcc "<command with {src} {out}>" compiles,
           --exec "<command with {out}>" runs the module (device bridge or RV32 emulator).
@@ -42,7 +42,7 @@ from simfw import build as simfw  # noqa: E402
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 UNIT = os.path.join(ROOT, "tests", "unit")
 ERRS = os.path.join(ROOT, "tests", "errors")
-SDK_INC = os.path.join(ROOT, "sdcard", "pico-dev", "include")
+SDK_INC = os.path.join(ROOT, "sdcard", "picocalc-studio", "include")
 
 HOST_GCC_CANDIDATES = [r"C:\msys64\mingw32\bin\gcc.exe", "i686-w64-mingw32-gcc", "gcc"]
 RV_GCC_GLOB = os.path.expanduser(
@@ -174,9 +174,9 @@ def sim_exec(elf, args=(), sd=None, timeout=120, max_insns=None):
 
 
 def new_sd_dir(tmp):
-    """Fresh SD-card directory, laid out like the device (/sd/pico-dev/tests exists)."""
+    """Fresh SD-card directory, laid out like the device (/sd/picocalc-studio/tests exists)."""
     sd = os.path.join(tmp, "sd")
-    os.makedirs(os.path.join(sd, "pico-dev", "tests"), exist_ok=True)
+    os.makedirs(os.path.join(sd, "picocalc-studio", "tests"), exist_ok=True)
     return sd
 
 

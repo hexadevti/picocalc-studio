@@ -16,7 +16,7 @@
 #define H 320
 #define STEP_MS 16
 #define PI 3.14159265f
-#define HISCORE_FILE SD_ROOT "/pico-dev/asteroids.hi"
+#define HISCORE_FILE SD_ROOT "/picocalc-studio/asteroids.hi"
 
 #define MAX_ROCKS 40
 #define MAX_SHOTS 16

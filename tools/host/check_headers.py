@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Verify the PicoCalc C headers (sdcard/pico-dev/include) against the firmware's newlib.
+Verify the PicoCalc C headers (sdcard/picocalc-studio/include) against the firmware's newlib.
 
   python tools/host/check_headers.py [-v]
 
@@ -30,7 +30,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-INC = os.path.join(ROOT, "sdcard", "pico-dev", "include")
+INC = os.path.join(ROOT, "sdcard", "picocalc-studio", "include")
 EXPORTS = os.path.join(ROOT, "firmware", "picocalc_studio", "src", "rt", "exports.txt")
 RV_GCC_GLOB = os.path.expanduser(
     r"~/.emu6502-p4/data/packages/esp32/tools/esp-rv32/*/bin/riscv32-esp-elf-gcc*")

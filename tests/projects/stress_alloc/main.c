@@ -11,7 +11,7 @@
 
 #define BLOCKS 64
 #define FILES 4
-#define TMP_DIR SD_ROOT "/pico-dev/tests/tmp_stress"   /* not tests/tmp: t18 lists that */
+#define TMP_DIR SD_ROOT "/picocalc-studio/tests/tmp_stress"   /* not tests/tmp: t18 lists that */
 
 void setup(void)
 {

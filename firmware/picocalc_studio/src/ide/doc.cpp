@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include "esp_heap_caps.h"
 #include "doc.h"
 
@@ -43,26 +44,78 @@ static void touch(Doc *d, int y) {
 }
 
 // Appends text to a fresh doc, splitting lines and expanding tabs.
-static bool load(Doc *d, const char *text, size_t len) {
-  if (!reserveLines(d, 1)) return false;
-  d->n = 1;
-  memset(&d->ln[0], 0, sizeof d->ln[0]);
-  for (size_t i = 0; i < len; i++) {
-    const char c = text[i];
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (!reserveLines(d, d->n + 1)) return false;
-      memset(&d->ln[d->n++], 0, sizeof d->ln[0]);
-      continue;
+// Makes the lines of an empty doc from text given in pieces. Each line is allocated once, at its
+// length, and the line array is cut to fit at the end: a big file is opened with little room.
+struct Loader {
+  Doc *d;
+  DocLine cur = {nullptr, 0, 0};   // the line being read
+
+  explicit Loader(Doc *doc) : d(doc) {}
+  ~Loader() { free(cur.s); }
+
+  bool endLine() {
+    if (!reserveLines(d, d->n + 1)) return false;
+    DocLine &l = d->ln[d->n];
+    l = {nullptr, 0, 0};
+    if (cur.len) {
+      if (!(l.s = (char *)psRealloc(nullptr, cur.len))) return false;
+      memcpy(l.s, cur.s, cur.len);
+      l.len = l.cap = cur.len;
     }
-    DocLine *l = &d->ln[d->n - 1];
-    const int add = c == '\t' ? DOC_TAB - l->len % DOC_TAB : 1;
-    if (!reserveChars(l, l->len + add)) return false;
-    for (int k = 0; k < add; k++) l->s[l->len++] = c == '\t' ? ' ' : c;
+    d->n++;
+    cur.len = 0;
+    return true;
   }
+
+  bool put(const char *text, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+      const char c = text[i];
+      if (c == '\r') continue;
+      if (c == '\n') {
+        if (!endLine()) return false;
+        continue;
+      }
+      const int add = c == '\t' ? DOC_TAB - cur.len % DOC_TAB : 1;
+      if (!reserveChars(&cur, cur.len + add)) return false;
+      for (int k = 0; k < add; k++) cur.s[cur.len++] = c == '\t' ? ' ' : c;
+    }
+    return true;
+  }
+
   // A final newline doesn't make an empty last line in the editor; doc_save() puts it back.
-  if (d->n > 1 && d->ln[d->n - 1].len == 0) { free(d->ln[d->n - 1].s); d->n--; }
-  return true;
+  bool finish() {
+    if ((cur.len || !d->n) && !endLine()) return false;
+    if (d->cap > d->n) {   // if a shrink fails, the old, bigger block holds n as well
+      if (DocLine *ln = (DocLine *)psRealloc(d->ln, d->n * sizeof *d->ln)) d->ln = ln;
+      if (uint8_t *hl = (uint8_t *)psRealloc(d->hl, d->n)) d->hl = hl;
+      d->cap = d->n;
+    }
+    return true;
+  }
+};
+
+static bool load(Doc *d, const char *text, size_t len) {
+  Loader l(d);
+  if (l.put(text, len) && l.finish()) return true;
+  errno = ENOMEM;
+  return false;
+}
+
+// Reads the file into an empty doc, in pieces. False with errno set on failure.
+static bool loadFile(Doc *d, const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+  bool ok = true;
+  if (fseek(f, 0, SEEK_END) || ftell(f) > MAX_FILE) { ok = false; errno = EFBIG; }
+  fseek(f, 0, SEEK_SET);
+  Loader l(d);
+  char buf[512];
+  for (size_t n; ok && (n = fread(buf, 1, sizeof buf, f)) > 0;)
+    if (!l.put(buf, n)) { ok = false; errno = ENOMEM; }
+  if (ok && ferror(f)) { ok = false; errno = EIO; }
+  fclose(f);
+  if (ok && !l.finish()) { ok = false; errno = ENOMEM; }
+  return ok;
 }
 
 static Doc *s_open;            // open docs, for doc_park_all()
@@ -82,33 +135,17 @@ Doc *doc_new(const char *path, const char *text) {
 }
 
 // The whole file, malloc'ed and NUL-terminated (*len gets its length). Null if it can't be read.
-static char *readFile(const char *path, size_t *len) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return nullptr;
-  fseek(f, 0, SEEK_END);
-  long size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (size < 0 || size > MAX_FILE) { fclose(f); return nullptr; }
-  char *buf = (char *)psRealloc(nullptr, size + 1);
-  if (!buf) { fclose(f); return nullptr; }
-  size_t got = fread(buf, 1, size, f);
-  fclose(f);
-  buf[got] = 0;
-  *len = got;
-  return buf;
-}
-
 Doc *doc_open(const char *path) {
-  size_t len;
-  char *buf = readFile(path, &len);
-  if (!buf) return nullptr;
   Doc *d = (Doc *)calloc(1, sizeof *d);
-  if (d) {
-    snprintf(d->path, sizeof d->path, "%s", path);
-    if (load(d, buf, len)) addOpen(d);
-    else { doc_free(d); d = nullptr; }
+  if (!d) { errno = ENOMEM; return nullptr; }
+  snprintf(d->path, sizeof d->path, "%s", path);
+  if (!loadFile(d, path)) {
+    const int err = errno;
+    doc_free(d);
+    errno = err;
+    return nullptr;
   }
-  free(buf);
+  addOpen(d);
   return d;
 }
 
@@ -176,11 +213,7 @@ void doc_unpark_all() {
   for (Doc *d = s_open; d; d = d->nextOpen) {
     if (!d->parked) continue;
     d->parked = false;
-    size_t len;
-    char *buf = readFile(d->path, &len);
-    const bool ok = buf && load(d, buf, len);
-    free(buf);
-    if (!ok) {
+    if (!loadFile(d, d->path)) {
       // Keep the doc (the editor holds it) but never let it be saved over the file.
       freeLines(d);
       dropUndo(d, 0, d->nt);

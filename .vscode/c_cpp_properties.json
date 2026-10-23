@@ -4,7 +4,7 @@
     {
       "name": "6502 Dev Studio",
       "includePath": [
-        "c:\\Users\\lucia\\repos\\pico-dev",
+        "c:\\Users\\lucia\\repos\\picocalc-studio",
         "c:\\Users\\lucia\\.vscode\\extensions\\hexadevti.6502-dev-studio-0.1.0\\apps\\_libA2",
         "c:\\Users\\lucia\\.vscode\\extensions\\hexadevti.6502-dev-studio-0.1.0\\toolchain\\win32-x64\\include"
       ],
@@ -27,7 +27,7 @@
       "intelliSenseMode": "clang-x64",
       "browse": {
         "path": [
-          "c:\\Users\\lucia\\repos\\pico-dev",
+          "c:\\Users\\lucia\\repos\\picocalc-studio",
           "c:\\Users\\lucia\\.vscode\\extensions\\hexadevti.6502-dev-studio-0.1.0\\apps\\_libA2",
           "c:\\Users\\lucia\\.vscode\\extensions\\hexadevti.6502-dev-studio-0.1.0\\toolchain\\win32-x64\\include"
         ],

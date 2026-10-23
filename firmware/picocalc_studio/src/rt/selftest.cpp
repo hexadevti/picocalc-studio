@@ -1,10 +1,10 @@
 // selftest.cpp - serial "@test [filter]": the compiler test suite, run on the device.
 //
-// Compiles every /sd/pico-dev/tests/unit/*.c with the on-device compiler, runs it from flash and
+// Compiles every /sd/picocalc-studio/tests/unit/*.c with the on-device compiler, runs it from flash and
 // compares its stdout with the matching .expected file; then checks that every
-// /sd/pico-dev/tests/errors/*.c is rejected as its "// EXPECT:" header says (see
+// /sd/picocalc-studio/tests/errors/*.c is rejected as its "// EXPECT:" header says (see
 // tests/errors/README.md). A filter runs only the files whose name contains it. Results go to the
-// serial log and to /sd/pico-dev/tests/results.txt. Copy tests/unit and tests/errors there first.
+// serial log and to /sd/picocalc-studio/tests/results.txt. Copy tests/unit and tests/errors there first.
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,8 +21,8 @@
 #include "runner.h"
 #include "selftest.h"
 
-#define TESTS_DIR "/sd/pico-dev/tests"
-#define INCLUDE_DIR "/sd/pico-dev/include"
+#define TESTS_DIR "/sd/picocalc-studio/tests"
+#define INCLUDE_DIR "/sd/picocalc-studio/include"
 #ifdef CC_BORROW_FRAMEBUFFER
 #define MAX_OUTPUT (8 * 1024)   // no PSRAM: 64 KB in one piece is rarely free after a build
 #else

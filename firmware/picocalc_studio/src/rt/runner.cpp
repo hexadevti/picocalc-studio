@@ -19,7 +19,7 @@
 #include "runner.h"
 #include "selftest.h"
 
-#define INCLUDE_DIR "/sd/pico-dev/include"
+#define INCLUDE_DIR "/sd/picocalc-studio/include"
 #ifndef PROGRAM_STACK
 #define PROGRAM_STACK (32 * 1024)
 #endif

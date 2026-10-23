@@ -37,7 +37,7 @@ int rt_run(const void *image, size_t size, const RtRunOptions *opt, RtRunResult 
 const char *rt_end_name(RtEnd end);
 
 // Compiles and links source files into a .pcx image (malloc'ed, caller frees). Headers come from
-// /sd/pico-dev/include. Returns null with the message in cc_error().
+// /sd/picocalc-studio/include. Returns null with the message in cc_error().
 uint8_t *rt_build(const char *const *paths, int n, size_t *size);
 
 // rt_build() on a temporary 64 KB task: the compiler recurses deeply. Blocks the caller.

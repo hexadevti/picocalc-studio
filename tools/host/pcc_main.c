@@ -7,7 +7,7 @@
 // no-PSRAM device lends it the framebuffer (cc_arena_lend()). --stack limits its stack depth
 // (cc_stack_limit), as the device does.
 //
-// Defaults: -I <repo>/sdcard/pico-dev/include, --exports <repo>/firmware/.../src/rt/exports_table.S
+// Defaults: -I <repo>/sdcard/picocalc-studio/include, --exports <repo>/firmware/.../src/rt/exports_table.S
 // (both found relative to this executable in <repo>/build/host). Built by build_host.py.
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: pcc [-msoft-float] [-I dir] [-D name[=val]] [--exports file] file.c... -o out.pcx\n");
     return 2;
   }
-  incs[ninc++] = repo_path(argv[0], "sdcard/pico-dev/include");
+  incs[ninc++] = repo_path(argv[0], "sdcard/picocalc-studio/include");
   load_exports(exp ? exp : repo_path(argv[0], "firmware/picocalc_studio/src/rt/exports_table.S"));
 
   CcOptions opt = {incs, ninc, defs, ndef, have_import};

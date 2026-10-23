@@ -21,7 +21,7 @@
 extern "C" int *__errno(void);
 #define errno (*__errno())
 
-// Compiled programs see these through /sd/pico-dev/include (sys/stat.h, dirent.h).
+// Compiled programs see these through /sd/picocalc-studio/include (sys/stat.h, dirent.h).
 static_assert(sizeof(struct stat) == 88, "struct stat layout");
 static_assert(offsetof(struct stat, st_mode) == 4, "struct stat layout");
 static_assert(offsetof(struct stat, st_size) == 16, "struct stat layout");

@@ -6,8 +6,8 @@ Inputs:
   firmware/picocalc_studio/src/rt/exports.txt   libc / libm / libgcc symbols (`name` or `name=target`)
 Outputs:
   firmware/picocalc_studio/src/rt/exports_table.S   sorted {name, address} table: rt_exports[], rt_exports_count
-  sdcard/pico-dev/include/picocalc.h                 copy of the SDK header for the on-device compiler
-  sdcard/pico-dev/lib/picocalc/*.cpp                 copies of the SDK sources, for the IDE's F9 (read-only)
+  sdcard/picocalc-studio/include/picocalc.h                 copy of the SDK header for the on-device compiler
+  sdcard/picocalc-studio/lib/picocalc/*.cpp                 copies of the SDK sources, for the IDE's F9 (read-only)
 
 The table is assembly, not C, so it can name libc functions and compiler builtins without
 declaring them (no prototype or builtin clashes). Run it after changing either input:
@@ -28,8 +28,8 @@ FW = REPO / "firmware" / "picocalc_studio"
 HEADER = FW / "src" / "sdk" / "picocalc.h"
 EXTRA = FW / "src" / "rt" / "exports.txt"
 OUT = FW / "src" / "rt" / "exports_table.S"
-SD_HEADER = REPO / "sdcard" / "pico-dev" / "include" / "picocalc.h"
-SD_LIB = REPO / "sdcard" / "pico-dev" / "lib" / "picocalc"
+SD_HEADER = REPO / "sdcard" / "picocalc-studio" / "include" / "picocalc.h"
+SD_LIB = REPO / "sdcard" / "picocalc-studio" / "lib" / "picocalc"
 
 PROTO = re.compile(r"^[A-Za-z_][\w \t\*]*?\b([A-Za-z_]\w*)\s*\([^;{]*\)[^;{]*;")
 

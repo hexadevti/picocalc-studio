@@ -1,12 +1,13 @@
 // ide.cpp - see ide.h. A project is a folder of .c/.h files; every .c in it is compiled and
 // linked. Building saves all changed files first. The last project, file and line are kept in
-// /sd/pico-dev/ide.cfg so the IDE reopens them.
+// /sd/picocalc-studio/ide.cfg so the IDE reopens them.
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "esp_heap_caps.h"
@@ -24,13 +25,13 @@
 
 extern "C" char *cc_normpath(char *path);   // cc/alloc.c
 
-#define ROOT_DIR     "/sd/pico-dev"
-#define PROJECTS_DIR "/sd/pico-dev/projects"
-#define EXAMPLES_DIR "/sd/pico-dev/examples"
-#define INCLUDE_DIR  "/sd/pico-dev/include"
-#define LIB_DIR      "/sd/pico-dev/lib"      // LIB_DIR/<x>/: the sources of the library <x.h>
-#define CFG_PATH     "/sd/pico-dev/ide.cfg"
-#define APPS_DIR     "/sd/pico-dev/apps"   // default export folder (F5)
+#define ROOT_DIR     "/sd/picocalc-studio"
+#define PROJECTS_DIR "/sd/picocalc-studio/projects"
+#define EXAMPLES_DIR "/sd/picocalc-studio/examples"
+#define INCLUDE_DIR  "/sd/picocalc-studio/include"
+#define LIB_DIR      "/sd/picocalc-studio/lib"      // LIB_DIR/<x>/: the sources of the library <x.h>
+#define CFG_PATH     "/sd/picocalc-studio/ide.cfg"
+#define APPS_DIR     "/sd/picocalc-studio/apps"   // default export folder (F5)
 #define MAX_DOCS     12
 #define MAX_ITEMS    96
 #define MAX_REFS     48
@@ -215,7 +216,20 @@ static bool openFile(const char *path) {
     if (s_ndocs == MAX_DOCS) { setMsg(RED, "Too many changed files open: save first"); return false; }
   }
   Doc *d = doc_open(full);
-  if (!d) { setMsg(RED, "Can't open %s", baseName(full)); return false; }
+  if (!d) {   // say why: doc_open() can't tell
+    struct stat st;
+    FILE *f = fopen(full, "rb");
+    const int err = f ? 0 : errno;
+    if (f) fclose(f);
+    char why[80];
+    if (stat(full, &st)) snprintf(why, sizeof why, "not found");
+    else if (err) snprintf(why, sizeof why, "%s", strerror(err));
+    else snprintf(why, sizeof why, "out of memory for %ld bytes, %u KB free", (long)st.st_size,
+                  (unsigned)(hal_free_heap() >> 10));
+    hal_log("open %s failed: %s", full, why);
+    setMsg(RED, "Can't open %s: %s", baseName(full), why);
+    return false;
+  }
   d->readOnly = !inProject(full) || isExample();
   s_docs[s_ndocs] = d;
   s_cur = s_ndocs++;
@@ -525,7 +539,7 @@ static bool copyDir(const char *from, const char *to) {
   return ok;
 }
 
-// Copies an example into /sd/pico-dev/projects under a name the user picks, then opens the copy.
+// Copies an example into /sd/picocalc-studio/projects under a name the user picks, then opens the copy.
 static void copyExample(const char *example) {
   char name[33], src[160], dir[160];
   snprintf(name, sizeof name, "%s", example);
@@ -591,7 +605,7 @@ static int listProjects(const char *dir, char (*paths)[128], char (*labels)[64],
   return n;
 }
 
-// The project list: "My files" (the projects in /sd/pico-dev/projects), then the examples, which
+// The project list: "My files" (the projects in /sd/picocalc-studio/projects), then the examples, which
 // open read-only. Returns when a project is open or the user goes back to an open one.
 static void pickProject() {
   static char paths[MAX_ITEMS][128];
@@ -968,7 +982,7 @@ static const char kHelp[] =
     "F5   export <folder>/<project>.bin (.uf2 on the\n"
     "     Pico 2): a firmware that runs the program,\n"
     "     for PicoMultiLoader. Asks for the folder;\n"
-    "     the default is /sd/pico-dev/apps\n"
+    "     the default is /sd/picocalc-studio/apps\n"
     "F6   full build/program output (closing it also\n"
     "     hides the output panel)\n"
     "F7   output panel on/off: the last lines of the\n"
@@ -1020,7 +1034,7 @@ static const char kHelp[] =
     "closes; typing narrows the list.\n"
     "The status bar shows the chosen name's\n"
     "declaration. Names come from C, the headers\n"
-    "in /sd/pico-dev/include and the project's\n"
+    "in /sd/picocalc-studio/include and the project's\n"
     "files.\n"
     "\n"
     "Selecting\n"
@@ -1036,11 +1050,11 @@ static const char kHelp[] =
     "Typing replaces the selection. Tab/Alt-Tab\n"
     "indent/unindent the selected lines.\n"
     "\n"
-    "Projects are folders in /sd/pico-dev/projects.\n"
+    "Projects are folders in /sd/picocalc-studio/projects.\n"
     "Every .c file in the folder is compiled and\n"
     "linked. A program has setup() and loop(), or\n"
     "main().\n"
-    "Headers: /sd/pico-dev/include (picocalc.h is the\n"
+    "Headers: /sd/picocalc-studio/include (picocalc.h is the\n"
     "SDK). printf() output shows in the output panel.\n"
     "\n"
     "If a program crashes, the IDE reopens at the\n"

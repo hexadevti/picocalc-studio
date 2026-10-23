@@ -32,7 +32,7 @@
 #define PLANE_DROP (PLANE_Y * PLANE_D / (SCALE * VS))   /* so this much lower, in height units */
 #define MAX_PARTS 90
 #define MINI 76
-#define HISCORE_FILE SD_ROOT "/pico-dev/voxel.hi"
+#define HISCORE_FILE SD_ROOT "/picocalc-studio/voxel.hi"
 
 typedef struct { int cols, colw; float far, dz0, ddz; const char *name; } Quality;
 

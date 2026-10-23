@@ -39,7 +39,7 @@
 #define PL_W 120
 #define PL_H 72
 #define KEYC 0xF81F
-#define HISCORE_FILE SD_ROOT "/pico-dev/starfighter.hi"
+#define HISCORE_FILE SD_ROOT "/picocalc-studio/starfighter.hi"
 
 enum { M_WHITE, M_GREY, M_BLUE, M_CANOPY, M_ENGINE, M_RED, M_DARKRED, M_PURPLE, M_ROCK0, M_ROCK1, M_ROCK2,
        M_HULL, M_HULL2, M_PICKUP, M_FIRE, NMAT };

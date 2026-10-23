@@ -1,4 +1,4 @@
-// ide.h - the on-device IDE: projects in /sd/pico-dev/projects, the editor, build (F3) and run (F4).
+// ide.h - the on-device IDE: projects in /sd/picocalc-studio/projects, the editor, build (F3) and run (F4).
 #pragma once
 
 // Never returns. After a crash in a program, crashWhere is its "file.c:line" (from

@@ -43,7 +43,7 @@
 #define TPPU (48.0f / 24.0f)          /* trees are 24 units tall */
 #define KEYC 0xF81F                   /* transparent sprite colour */
 #define MINI 76
-#define HISCORE_FILE SD_ROOT "/pico-dev/kart.hi"
+#define HISCORE_FILE SD_ROOT "/picocalc-studio/kart.hi"
 
 enum { P_GRASS, P_GRASS2, P_ROAD, P_ROAD2, P_KERB_R, P_KERB_W, P_SAND, P_LINE_B, P_LINE_W,
        P_BOOST, P_BOOST2, P_WATER, P_WATER2, P_DIRT, NPAL };
