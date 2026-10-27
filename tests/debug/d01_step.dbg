@@ -1,0 +1,18 @@
+break d01_step.c:17
+run
+step        # into sq
+next
+next        # sq returns: back in main, still on its line
+next
+next
+step        # into fact(3)
+next
+step        # into fact(2): the same line, a deeper frame
+bt          # fact(2), fact(3), main
+finish      # back in fact(3), at the call
+finish      # back in main
+break d01_step.c:22
+continue
+continue
+delete d01_step.c:22
+continue

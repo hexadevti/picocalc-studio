@@ -22,6 +22,7 @@
 #include "../cc/cc.h"
 #include "../demo/demo.h"
 #include "../export/export.h"
+#include "../../version.h"
 
 extern "C" char *cc_normpath(char *path);   // cc/alloc.c
 
@@ -387,12 +388,21 @@ static uint8_t *build(size_t *size) {
   return image;
 }
 
-static void run() {
+// F4, or Ctrl-F4 for a debug run (docs/DEBUGGER.md): a debug build that stops at the breakpoints
+// of the open files (Ctrl-B) and on Break.
+static void run(bool debug) {
   size_t size;
+  cc_debug = debug;
   uint8_t *image = build(&size);
+  cc_debug = 0;
   if (!image) return;
   cfgSave();   // a crash reboots: come back to this project
-  outPrintf("Running %s\n", baseName(s_proj));
+  static RtBreakpoint bps[MAX_DOCS * DOC_MAX_BREAKS];
+  int nbps = 0;
+  for (int i = 0; debug && i < s_ndocs; i++)
+    for (int j = 0; j < s_docs[i]->nbp; j++) bps[nbps++] = {s_docs[i]->path, s_docs[i]->bp[j] + 1};
+  if (debug) outPrintf("Debugging %s: %d breakpoint%s\n", baseName(s_proj), nbps, nbps == 1 ? "" : "s");
+  else outPrintf("Running %s\n", baseName(s_proj));
   const int out0 = s_outLen;
   cookie_io_functions_t io = {nullptr, capWrite, nullptr, nullptr};
   FILE *out = fopencookie(nullptr, "w", io);
@@ -400,7 +410,7 @@ static void run() {
   char name[64];
   snprintf(name, sizeof name, "%s", baseName(s_proj));
   char *argv[2] = {name, nullptr};
-  RtRunOptions opt = {1, argv, out, true, 0};
+  RtRunOptions opt = {1, argv, out, true, 0, debug, bps, nbps};
   RtRunResult r;
   hal_breadcrumb("run %s", s_proj);
   const int rc = rt_run(image, size, &opt, &r);
@@ -973,12 +983,17 @@ static void pickFile() {
 }
 
 static const char kHelp[] =
-    "PicoCalc Studio\n"
+    PCS_NAME " " PCS_VERSION "\n"
     "\n"
     "F1   this help\n"
     "F2   mark mode on/off (select with the arrows)\n"
     "F3   build (saves all files first)\n"
     "F4   build and run; Break stops the program\n"
+    "Ctrl-F4  debug: build and run, stopping at the\n"
+    "     breakpoints (Ctrl-B on a line sets/clears\n"
+    "     one) and on Break. Stopped: F4 runs on,\n"
+    "     Down next line, Right step into, Left\n"
+    "     step out, Esc ends the program\n"
     "F5   export <folder>/<project>.bin (.uf2 on the\n"
     "     Pico 2): a firmware that runs the program,\n"
     "     for PicoMultiLoader. Asks for the folder;\n"
@@ -1333,7 +1348,7 @@ static void doCommand(int k) {
   if ((k & 0xFF) >= KEY_F6 && (k & 0xFF) <= KEY_F10 && !(k & (UI_CTRL | UI_ALT))) k &= ~UI_SHIFT;
   if (d && d->readOnly && isRef(d)) {   // a reference file: viewing keys only
     switch (k) {
-      case KEY_F3: case KEY_F4: case KEY_F5:
+      case KEY_F3: case KEY_F4: case KEY_F4 | UI_CTRL: case KEY_F5:
         setMsg(YELLOW, "Reference file: Esc back to the project to build");
         return;
       case KEY_ESC:
@@ -1347,7 +1362,8 @@ static void doCommand(int k) {
     case KEY_F1: helpMenu(); break;
     case KEY_F2: if (d) ed_mark(d); break;
     case KEY_F3: { size_t size; free(build(&size)); break; }
-    case KEY_F4: run(); break;
+    case KEY_F4: run(false); break;
+    case KEY_F4 | UI_CTRL: run(true); break;
     case KEY_F5: exportApp(); break;
     case KEY_F6:
       ui_text_view("Output", s_outLen ? s_out : "(no output yet)");
@@ -1380,6 +1396,12 @@ static void doCommand(int k) {
       if (s_find[0] && !ed_find(d, s_find, rows)) setMsg(YELLOW, "\"%s\" not found", s_find);
       break;
     case 'r' | UI_CTRL: replace(d, rows); break;
+    case 'b' | UI_CTRL:
+      if (!d) break;
+      if (!doc_toggle_break(d, d->cy)) setMsg(YELLOW, "Too many breakpoints in this file (%d)", DOC_MAX_BREAKS);
+      else if (doc_has_break(d, d->cy)) setMsg(UI_DIM, "Breakpoint on line %d (Ctrl-F4 debugs)", d->cy + 1);
+      else setMsg(UI_DIM, "Breakpoint off: line %d", d->cy + 1);
+      break;
     case ' ' | UI_CTRL:
       if (d && d->readOnly) readOnlyMsg(d);
       else if (d && !ac_open(s_docs, s_ndocs, d, rows)) setMsg(UI_DIM, "No names to complete");

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include "esp_heap_caps.h"
 #include "doc.h"
+#include "../sdk/picocalc.h"
 
 #define MAX_FILE (1024 * 1024)
 
@@ -235,6 +236,43 @@ void doc_unpark_all() {
   }
 }
 
+// ---- breakpoints ----
+// They follow their lines: inserting nl lines at (y, x) moves those below y down, and y's own when
+// x is 0 (the line itself moves); deleting lines y0+1..y1 moves theirs onto y0.
+
+static void breaksInsert(Doc *d, int y, int x, int nl) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] > y || (d->bp[i] == y && x == 0)) d->bp[i] += nl;
+}
+
+static void breaksDelete(Doc *d, int y0, int y1) {
+  int k = 0;
+  for (int i = 0; i < d->nbp; i++) {
+    const int b = d->bp[i] > y1 ? d->bp[i] - (y1 - y0) : d->bp[i] > y0 ? y0 : d->bp[i];
+    bool dup = false;
+    for (int j = 0; j < k; j++) dup |= d->bp[j] == b;
+    if (!dup) d->bp[k++] = b;
+  }
+  d->nbp = k;
+}
+
+bool doc_has_break(const Doc *d, int y) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] == y) return true;
+  return false;
+}
+
+bool doc_toggle_break(Doc *d, int y) {
+  for (int i = 0; i < d->nbp; i++)
+    if (d->bp[i] == y) {
+      d->bp[i] = d->bp[--d->nbp];
+      return true;
+    }
+  if (d->nbp == DOC_MAX_BREAKS) return false;
+  d->bp[d->nbp++] = y;
+  return true;
+}
+
 // ---- raw edits (not recorded) ----
 
 static bool rawInsert(Doc *d, int y, int x, const char *s, int n, int *ey, int *ex) {
@@ -254,6 +292,7 @@ static bool rawInsert(Doc *d, int y, int x, const char *s, int n, int *ey, int *
     memmove(&d->ln[y + 1 + nl], &d->ln[y + 1], (d->n - y - 1) * sizeof *d->ln);
     memset(&d->ln[y + 1], 0, nl * sizeof *d->ln);
     d->n += nl;
+    breaksInsert(d, y, x, nl);
   }
   int cy = y, cx = x;
   for (int i = 0; i < n;) {
@@ -301,6 +340,7 @@ static void rawDelete(Doc *d, int y0, int x0, int y1, int x1) {
   for (int i = y0 + 1; i <= y1; i++) free(d->ln[i].s);
   memmove(&d->ln[y0 + 1], &d->ln[y1 + 1], (d->n - y1 - 1) * sizeof *d->ln);
   d->n -= y1 - y0;
+  breaksDelete(d, y0, y1);
 }
 
 char *doc_get_text(const Doc *d, int y0, int x0, int y1, int x1, int *n) {
@@ -469,8 +509,13 @@ static bool inList(const char *const *list, const char *s, int n) {
 
 static inline bool identChar(char c) { return isalnum((unsigned char)c) || c == '_'; }
 
-// Classifies one line (cls may be null) and returns whether it ends inside a /* comment.
-static bool scanLine(const char *s, int len, bool inComment, uint8_t *cls) {
+// Indexed by HL_*.
+const uint16_t hl_colors[] = {
+    RGB(220, 220, 220), RGB(110, 170, 255), RGB(80, 200, 180), RGB(190, 220, 160), RGB(230, 150, 110),
+    RGB(110, 150, 90),  RGB(200, 140, 200), RGB(230, 190, 90), RGB(230, 230, 160), RGB(170, 170, 180),
+};
+
+bool hl_scan(const char *s, int len, bool inComment, uint8_t *cls) {
   int i = 0;
   auto mark = [&](int from, int to, uint8_t c) {
     if (cls) memset(cls + from, c, to - from);
@@ -540,8 +585,8 @@ void doc_highlight(Doc *d, int y, uint8_t *cls) {
   if (d->hlValid < 1) { d->hl[0] = 0; d->hlValid = 1; }
   while (d->hlValid <= y) {
     const int i = d->hlValid - 1;
-    d->hl[i + 1] = scanLine(d->ln[i].s, d->ln[i].len, d->hl[i], nullptr);
+    d->hl[i + 1] = hl_scan(d->ln[i].s, d->ln[i].len, d->hl[i], nullptr);
     d->hlValid++;
   }
-  scanLine(d->ln[y].s, d->ln[y].len, d->hl[y], cls);
+  hl_scan(d->ln[y].s, d->ln[y].len, d->hl[y], cls);
 }

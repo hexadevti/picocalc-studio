@@ -1,11 +1,12 @@
 // pcc_main.c - host driver for the PicoCalc C compiler (firmware/picocalc_studio/src/cc).
 //
-//   pcc [-I dir]... [-D name[=value]]... [--exports file] [--mem] [--lend KB] [--stack KB] file.c... -o out.pcx
+//   pcc [-g] [-I dir]... [-D name[=value]]... [--exports file] [--mem] [--lend KB] [--stack KB] file.c... -o out.pcx
 //
 // --mem prints the compiler arena's peak (chunk bytes) to stderr. Only a 32-bit build matches the
 // device's struct sizes: see tools/host/mem.py. --lend lends the compiler a buffer of KB, as the
 // no-PSRAM device lends it the framebuffer (cc_arena_lend()). --stack limits its stack depth
-// (cc_stack_limit), as the device does.
+// (cc_stack_limit), as the device does. -g (or --debug) makes a debug build (cc_debug): stop
+// points and the debug trailer, see docs/DEBUGGER.md.
 //
 // Defaults: -I <repo>/sdcard/picocalc-studio/include, --exports <repo>/firmware/.../src/rt/exports_table.S
 // (both found relative to this executable in <repo>/build/host). Built by build_host.py.
@@ -100,6 +101,8 @@ int main(int argc, char **argv) {
       size_t n = (size_t)atoi(argv[++i]) * 1024;
       cc_arena_lend(malloc(n), n);
     }
+    else if (!strcmp(a, "-g") || !strcmp(a, "--debug"))
+      cc_debug = 1;
     else if (!strcmp(a, "-msoft-float"))
       cc_soft_float = 1;
     else if (!strncmp(a, "-I", 2))
@@ -113,7 +116,7 @@ int main(int argc, char **argv) {
       srcs[nsrc++] = a;
   }
   if (!nsrc || !out) {
-    fprintf(stderr, "usage: pcc [-msoft-float] [-I dir] [-D name[=val]] [--exports file] file.c... -o out.pcx\n");
+    fprintf(stderr, "usage: pcc [-g] [-msoft-float] [-I dir] [-D name[=val]] [--exports file] file.c... -o out.pcx\n");
     return 2;
   }
   incs[ninc++] = repo_path(argv[0], "sdcard/picocalc-studio/include");

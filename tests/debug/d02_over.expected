@@ -1,0 +1,18 @@
+@break d02_over.c:19
+@stop d02_over.c:19
+@break d02_over.c:13
+@stop d02_over.c:13
+@stop d02_over.c:13
+@bt fib d02_over.c:13
+@bt fib d02_over.c:15
+@bt fib d02_over.c:15
+@bt main d02_over.c:19
+@return d02_over.c:15
+@return d02_over.c:15
+@return d02_over.c:19
+@stop d02_over.c:20
+x=3 calls=9
+@stop d02_over.c:21
+@stop d02_over.c:22
+@stop d02_over.c:23
+d=2.2500 acc=3.7969

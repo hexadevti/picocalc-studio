@@ -7,6 +7,7 @@
 #include "../../board.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_memory_utils.h"
 #include "../hal/hal.h"
@@ -17,6 +18,7 @@
 #include "module.h"
 #include "../ide/doc.h"
 #include "runner.h"
+#include "debugger.h"
 #include "selftest.h"
 
 #define INCLUDE_DIR "/sd/picocalc-studio/include"
@@ -30,6 +32,7 @@
 
 #define BIT_DONE  1u
 #define BIT_BREAK 2u
+#define BIT_STOP  4u
 
 // State of the one running program. Written by the runner task before it signals BIT_DONE, read
 // by the supervisor after.
@@ -42,6 +45,17 @@ static struct {
   volatile bool breakReq;
   int status;
   RtEnd end;
+  // Debug runs: the program task stops at a stop point (BIT_STOP) and waits on `resume` while the
+  // supervisor shows the stopped view.
+  RtModule *mod;
+  bool debug;
+  PcxDbg dbg;
+  PcxDbgRegs *stopRegs;
+  uint32_t stopAt;       // the place (pcx.h) the program is stopped at
+  const char *stopWhy;
+  bool killReq;          // the stopped view ended the program
+  bool pausing;          // Break asked for a pause the program hasn't reached yet
+  SemaphoreHandle_t resume;
 } g;
 
 static sdk_exit_fn s_prevExit;
@@ -71,6 +85,76 @@ static void progAbort() {
 static void sdkExitHandler() {
   if (inProgram()) endProgram(g.breakReq ? RT_END_BREAK : RT_END_EXIT, 0);
   s_prevExit();
+}
+
+// On the program task: hands a stop to the supervisor and waits for its command.
+static void stopHere(PcxDbgRegs *regs, uint32_t at, const char *why) {
+  g.stopRegs = regs;
+  g.stopAt = at;
+  g.stopWhy = why;
+  xTaskNotify(g.supervisor, BIT_STOP, eSetBits);
+  xSemaphoreTake(g.resume, portMAX_DELAY);
+  if (g.killReq) endProgram(RT_END_BREAK, 0);
+}
+
+// A debug build's stop point whose flag is set (docs/DEBUGGER.md).
+extern "C" void __pc_dbg_stop(PcxDbgRegs *regs) {
+  if (!g.debug || !inProgram()) return;
+  const int id = pcx_stop_index(&g.mod->view, regs->x[5] - (uint32_t)(uintptr_t)g.mod->text);
+  if (!pcx_dbg_check(&g.dbg, id, regs->x[8])) return;
+  stopHere(regs, g.mod->view.stops[id],
+           g.dbg.bp[id] ? "breakpoint" : g.dbg.mode == PCX_DBG_PAUSE ? "paused" : "step");
+}
+
+// A stepped function returning through pcx_dbg_ret_tramp: it always needs its real return address,
+// even once the run is no longer stepping.
+extern "C" void __pc_dbg_return(PcxDbgRegs *regs) {
+  const int r = pcx_dbg_return(&g.dbg, regs);
+  if (r < 0) {
+    hal_log("debug: return from a frame the debugger never patched");
+    if (inProgram()) endProgram(RT_END_ABORT, 134);
+    abort();
+  }
+  if (!r || !g.debug || !inProgram()) return;
+  stopHere(regs, regs->x[5] - (uint32_t)(uintptr_t)g.mod->text - 1,
+           g.dbg.mode == PCX_DBG_PAUSE ? "paused" : "return");
+}
+
+// The supervisor's side of a stop: the stopped view, then the program goes on as it says.
+static void onStop() {
+  g.pausing = false;
+  const int mode = rt_dbg_view(g.mod, &g.dbg, g.stopAt, g.stopRegs, g.stopWhy);
+  // Break pressed in the view was the view's key, not a pause.
+  ulTaskNotifyValueClear(nullptr, BIT_BREAK);
+  g.breakReq = false;
+  if (mode < 0) g.killReq = true;
+  else pcx_dbg_resume(&g.dbg, mode, g.stopAt, g.stopRegs->x[8]);
+  xSemaphoreGive(g.resume);
+}
+
+// Starts a debug run of m: the breakpoints, and Break pauses rather than ends. False (a normal
+// run) if m isn't a debug build or there is no memory.
+static bool debugStart(RtModule *m, const RtRunOptions *opt) {
+  const PcxDebug *d = m->view.dbg;
+  if (!opt->debug || !d || !d->n_stops) return false;
+  if (!g.resume && !(g.resume = xSemaphoreCreateBinary())) return false;
+  uint8_t *bp = (uint8_t *)malloc(d->n_stops);
+  if (!bp) return false;
+  pcx_dbg_init(&g.dbg, &m->view, (uint32_t)(uintptr_t)m->text, m->ram, bp);
+  for (int i = 0; i < opt->nbreakpoints; i++)
+    if (!pcx_dbg_break(&g.dbg, opt->breakpoints[i].file, opt->breakpoints[i].line, 1))
+      hal_log("debug: no code at or after %s:%d", opt->breakpoints[i].file, opt->breakpoints[i].line);
+  while (xSemaphoreTake(g.resume, 0) == pdTRUE) {}
+  sdk_set_break_exits(false);
+  return true;
+}
+
+static void debugEnd() {
+  if (!g.debug) return;
+  sdk_set_break_exits(true);
+  free(g.dbg.bp);
+  memset(&g.dbg, 0, sizeof g.dbg);
+  g.debug = false;
 }
 
 // Keyboard task: Break pressed while a program runs.
@@ -286,6 +370,9 @@ static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtR
   g.breakReq = false;
   g.status = 0;
   g.end = RT_END_RETURN;
+  g.mod = &m;
+  g.killReq = g.pausing = false;
+  g.debug = debugStart(&m, opt);
   g.supervisor = xTaskGetCurrentTaskHandle();
   xTaskNotifyStateClear(nullptr);
   ulTaskNotifyValueClear(nullptr, 0xFFFFFFFFu);
@@ -301,6 +388,7 @@ static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtR
   if (xTaskCreatePinnedToCore(runnerTask, "program", PROGRAM_STACK, &m, 1, &task, xPortGetCoreID()) != pdPASS) {
     vTaskPrioritySet(nullptr, prio);
     sdk_set_exit_handler(s_prevExit);
+    debugEnd();
     rt_module_unload(&m);
     snprintf(r->err, sizeof r->err, "cannot start the program task");
     return -1;
@@ -320,7 +408,24 @@ static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtR
     }
     xTaskNotifyWait(0, 0xFFFFFFFFu, &bits, wait);
     if (bits & BIT_DONE) { done = true; break; }
+    if (bits & BIT_STOP) {
+      onStop();
+      continue;
+    }
+    if ((bits & BIT_BREAK) && g.debug && !g.pausing) {
+      // Stop at the next stop point. A second Break before that (the program is in code without
+      // stop points) ends it the usual way: its next SDK call sees the Break.
+      g.pausing = true;
+      g.breakReq = false;
+      pcx_dbg_pause(&g.dbg);
+      continue;
+    }
     if (bits & BIT_BREAK) {
+      if (g.debug) {
+        sdk_set_break_exits(true);
+        memset(g.dbg.bp, 0, g.dbg.n);   // and no more stops
+        pcx_dbg_resume(&g.dbg, PCX_DBG_RUN, UINT32_MAX, 0);
+      }
       // The program's next kbd/sys call sees the queued Break and exits through sdkExitHandler.
       const uint32_t until = hal_millis() + BREAK_GRACE_MS;
       while (!done && (int32_t)(until - hal_millis()) > 0) {
@@ -344,6 +449,7 @@ static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtR
   }
   sdk_set_exit_handler(s_prevExit);
   vTaskPrioritySet(nullptr, prio);
+  debugEnd();
   releaseAll(!done, r);
   rt_module_unload(&m);
   if (opt->foreground) sdk_reset();

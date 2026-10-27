@@ -32,6 +32,11 @@ typedef struct {
 // compiler itself was built for; the host tools set it with -msoft-float.
 extern int cc_soft_float;
 
+// Nonzero: debug build. Every statement starts with a stop point (docs/DEBUGGER.md): a check of
+// its byte in __dbg_flags that calls the firmware's __pc_dbg_stop() when set. The image gets a
+// PcxDebug trailer (rt/pcx.h). 0 (the default) emits exactly the code of a normal build.
+extern int cc_debug;
+
 // In-memory object file (one translation unit). Lives in the compiler arena.
 enum { CC_TEXT, CC_RODATA, CC_DATA, CC_BSS, CC_NSECT };
 enum { CC_R_PAIR, CC_R_ABS32 };  // same encodings as PCX_R_PAIR / PCX_R_ABS32
@@ -77,6 +82,14 @@ typedef struct {
   int nparts;
 } CcSection;
 
+// A function of a debug build: its code and frame, for the debugger's call stack (PcxFunc).
+typedef struct {
+  uint32_t lo, hi;     // text offsets: [lo, hi)
+  char *name;
+  uint32_t va;         // 32 if variadic: the register save area above the saved ra/s0
+  uint32_t save_x, save_f;  // callee-saved registers the prologue stores (bit = register)
+} CcFunc;
+
 typedef struct {
   char *path;          // main source file
   CcSection sect[CC_NSECT];
@@ -88,6 +101,10 @@ typedef struct {
   int nlines, caplines;
   char **files;        // source files the line table refers to
   int nfiles, capfiles;
+  uint32_t *stops;     // cc_debug: text offset of each stop point; its index is its flag's
+  int nstops, capstops;  // offset from __dbg_flags
+  CcFunc *funcs;       // cc_debug: every function, in text order
+  int nfuncs, capfuncs;
 } CcObject;
 
 // Compiles one C file. Returns 0, or -1 with the message in cc_error().

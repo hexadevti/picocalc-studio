@@ -12,12 +12,6 @@
 #define ERR_BG    RGB(100, 20, 24)
 #define SEL_BG    RGB(50, 80, 150)
 
-// Indexed by HL_*.
-static const color_t kColors[] = {
-    RGB(220, 220, 220), RGB(110, 170, 255), RGB(80, 200, 180), RGB(190, 220, 160), RGB(230, 150, 110),
-    RGB(110, 150, 90),  RGB(200, 140, 200), RGB(230, 190, 90), RGB(230, 230, 160), RGB(170, 170, 180),
-};
-
 static char *s_clip;       // clipboard, shared by all files
 static int s_clipLen;
 static bool s_clipLines;   // whole lines (copied without a selection): paste above the cursor line
@@ -77,7 +71,9 @@ void ed_draw(Doc *d, int y0, int rows, int errLine) {
       if (b > a) gfx_fill_rect(ED_X0 + (a - d->left) * UI_CW, y, (b - a) * UI_CW, UI_CH, SEL_BG);
     }
     snprintf(buf, sizeof buf, "%4d", i + 1);
-    gfx_text(0, y, buf, i == d->cy ? RGB(230, 210, 120) : UI_DIM);
+    const bool bp = d->nbp && doc_has_break(d, i);
+    if (bp) gfx_fill_rect(0, y, ED_X0 - 3, UI_CH, RGB(150, 30, 30));
+    gfx_text(0, y, buf, bp ? RGB(255, 255, 255) : i == d->cy ? RGB(230, 210, 120) : UI_DIM);
     if (l->len > clsCap) {
       int cap = l->len + 64;
       uint8_t *p = (uint8_t *)realloc(cls, cap);
@@ -92,7 +88,7 @@ void ed_draw(Doc *d, int y0, int rows, int errLine) {
       int n = 0;
       while (x + n < end && cls[x + n] == c) { buf[n] = l->s[x + n]; n++; }
       buf[n] = 0;
-      gfx_text(ED_X0 + (x - d->left) * UI_CW, y, buf, kColors[c]);
+      gfx_text(ED_X0 + (x - d->left) * UI_CW, y, buf, hl_colors[c]);
       x += n;
     }
   }

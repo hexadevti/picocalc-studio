@@ -21,6 +21,9 @@ static uint8_t s_prHead, s_prLen;
 static uint32_t s_down[8];          // bitmap of held codes
 static int s_repeatKey = KEY_NONE;
 static uint32_t s_repeatAt;
+static bool s_breakExits = true;
+
+void sdk_set_break_exits(bool on) { s_breakExits = on; }
 
 static inline bool isDown(int c) { return (s_down[c >> 5] >> (c & 31)) & 1; }
 static inline void setDown(int c, bool on) {
@@ -67,7 +70,10 @@ void sdk_kbd_pump() {
       s_repeatKey = KEY_NONE;
       continue;
     }
-    if (k.code == KEY_BREAK && k.state == HAL_KEY_PRESSED) sdk_exit();
+    if (k.code == KEY_BREAK && k.state == HAL_KEY_PRESSED) {
+      if (s_breakExits) sdk_exit();
+      continue;
+    }
     if (k.state == HAL_KEY_PRESSED) {
       setDown(k.code, true);
       pushEvent(k.code, KEY_PRESSED);

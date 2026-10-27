@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define DOC_TAB 4
+#define DOC_MAX_BREAKS 16
 
 struct DocLine {
   char *s;                 // not NUL-terminated
@@ -39,6 +40,9 @@ struct Doc {
   // undo: u[0, nu) can be undone, u[nu, nt) redone
   DocUndo *u;
   int nu, nt, ucap, group;
+  // debugger breakpoints: line indexes, unordered; edits move them with their lines
+  int bp[DOC_MAX_BREAKS];
+  int nbp;
   bool parked;             // doc_park_all() freed the lines
   Doc *nextOpen;           // doc.cpp's list of open docs
 };
@@ -68,6 +72,10 @@ char *doc_get_text(const Doc *d, int y0, int x0, int y1, int x1, int *n);
 bool doc_undo(Doc *d);
 bool doc_redo(Doc *d);
 
+// Sets or clears a breakpoint on line y; false if it was full.
+bool doc_toggle_break(Doc *d, int y);
+bool doc_has_break(const Doc *d, int y);
+
 // Leading spaces of line y.
 int doc_indent(const Doc *d, int y);
 
@@ -75,3 +83,8 @@ int doc_indent(const Doc *d, int y);
 enum { HL_TEXT, HL_KEYWORD, HL_TYPE, HL_NUMBER, HL_STRING, HL_COMMENT, HL_PREPROC, HL_CONST, HL_FUNC, HL_PUNCT };
 // Fills cls[0..len) for line y (which must exist).
 void doc_highlight(Doc *d, int y, uint8_t *cls);
+// Classifies len characters of one line into cls (may be null), given whether the line starts
+// inside a /* comment; returns whether it ends inside one. For text outside a Doc (the debugger).
+bool hl_scan(const char *s, int len, bool inComment, uint8_t *cls);
+// The editor's RGB565 color of each HL_* class.
+extern const uint16_t hl_colors[];

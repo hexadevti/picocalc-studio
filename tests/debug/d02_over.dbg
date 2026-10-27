@@ -1,0 +1,14 @@
+break d02_over.c:18     # main's first line has no stop: moves to 19
+run
+break d02_over.c:12     # a blank line: moves to 13
+next                    # over fib(4), but the breakpoint inside it stops first
+continue                # the next fib(0)/fib(1)
+bt                      # fib(1), fib(2), fib(4), main: pcc calls fib(n - 2) first
+delete d02_over.c:13
+finish                  # back in fib(2)
+finish                  # back in fib(4)
+finish                  # back in main
+next
+next
+next                    # over a loop that sits on one line
+next

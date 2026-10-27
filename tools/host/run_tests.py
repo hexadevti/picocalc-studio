@@ -22,6 +22,9 @@ Modes
           where the modules are written to <tmp>/sd/pcx/ and {gout} is the guest path
           (/sd/pcx/tNN.pcx); a custom --exec may use {gout} too.
           Unit tests must reproduce the .expected output; error tests must fail as declared.
+  debug   Debugger scripts: every tests/debug/NAME.c is compiled with --pcc (which must pass -g)
+          and run under rvsim with "pcxrun --dbg NAME.dbg"; stdout (the program's output with
+          the "@break"/"@stop" lines of tools/host/simfw/pcxrun.c) must match NAME.expected.
   all     ref + target + errors + simref (default).
 
 Exit status is the number of failures (0 = all good).
@@ -41,6 +44,7 @@ from simfw import build as simfw  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 UNIT = os.path.join(ROOT, "tests", "unit")
+DEBUG = os.path.join(ROOT, "tests", "debug")
 ERRS = os.path.join(ROOT, "tests", "errors")
 SDK_INC = os.path.join(ROOT, "sdcard", "picocalc-studio", "include")
 
@@ -246,7 +250,7 @@ def mode_errors():
                     print(f"  ok   {name} (compiles; must fail at link)")
 
 
-def mode_pcc(pcc_cmd, exec_cmd):
+def mode_pcc(pcc_cmd, exec_cmd, pcxrun_args=""):
     if not pcc_cmd:
         sys.exit("pcc mode needs --pcc")
     with tempfile.TemporaryDirectory() as tmp:
@@ -259,7 +263,7 @@ def mode_pcc(pcc_cmd, exec_cmd):
             # forward slashes: the command goes through shlex.split, which eats backslashes
             fwd = lambda p: p.replace("\\", "/")  # noqa: E731
             exec_cmd = (f'"{fwd(build_host.RVSIM_EXE)}" --sd "{fwd(sd)}" '
-                        f'"{fwd(build_host.PCXRUN_ELF)}" "{{gout}}"')
+                        f'"{fwd(build_host.PCXRUN_ELF)}" {pcxrun_args} "{{gout}}"')
         gpath = lambda p: "/sd/" + os.path.relpath(p, sd).replace("\\", "/")  # noqa: E731
         for src in unit_tests():
             name = os.path.splitext(os.path.basename(src))[0]
@@ -297,6 +301,35 @@ def mode_pcc(pcc_cmd, exec_cmd):
                 print(f"  ok   {name}")
 
 
+def mode_debug(pcc_cmd):
+    if not pcc_cmd:
+        sys.exit("debug mode needs --pcc")
+    build_host.ensure_built()
+    with tempfile.TemporaryDirectory() as tmp:
+        sd = new_sd_dir(tmp)
+        outdir = os.path.join(sd, "pcx")
+        os.makedirs(outdir, exist_ok=True)
+        for src in sorted(glob.glob(os.path.join(DEBUG, "*.c"))):
+            base = os.path.splitext(src)[0]
+            name = os.path.basename(base)
+            out = os.path.join(outdir, name + ".pcx")
+            r = run(shlex.split(pcc_cmd.format(src=src.replace("\\", "/"), out=out.replace("\\", "/"))))
+            if r.returncode:
+                fail(f"{name}: pcc failed\n{r.stdout}{r.stderr}")
+                continue
+            with open(base + ".dbg", "rb") as f, open(os.path.join(outdir, name + ".dbg"), "wb") as g:
+                g.write(f.read())
+            p = sim_exec(build_host.PCXRUN_ELF, ["--dbg", f"/sd/pcx/{name}.dbg", f"/sd/pcx/{name}.pcx"], sd=sd)
+            got = p.stdout.decode(errors="replace").replace("\r\n", "\n")
+            with open(base + ".expected", newline="") as f:
+                want = f.read()
+            if p.returncode or got != want:
+                fail(f"{name}: mismatch (status {p.returncode})\n{p.stderr.decode(errors='replace')}"
+                     f"{diff(want, got)}")
+            else:
+                print(f"  ok   {name}")
+
+
 def diff(want, got):
     import difflib
     return "".join(difflib.unified_diff(want.splitlines(True), got.splitlines(True), "expected", "got", n=1))
@@ -304,10 +337,12 @@ def diff(want, got):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", nargs="?", default="all", choices=["all", "ref", "target", "errors", "simref", "pcc"])
+    ap.add_argument("mode", nargs="?", default="all", choices=["all", "ref", "target", "errors", "simref", "pcc", "debug"])
     ap.add_argument("--update", action="store_true", help="rewrite .expected files from the host build")
     ap.add_argument("--pcc", help='compiler command, e.g. "build/pcc {src} -o {out}"')
     ap.add_argument("--exec", dest="exec_cmd", help='module runner command, e.g. "build/rv32emu {out}"')
+    ap.add_argument("--pcxrun-args", default="",
+                    help='pcxrun options before the module (--exec rvsim), e.g. "--dbg all"')
     a = ap.parse_args()
     if a.mode in ("all", "ref"):
         mode_ref(a.update)
@@ -318,7 +353,9 @@ def main():
     if a.mode in ("all", "simref"):
         mode_simref()
     if a.mode == "pcc":
-        mode_pcc(a.pcc, a.exec_cmd)
+        mode_pcc(a.pcc, a.exec_cmd, a.pcxrun_args)
+    if a.mode == "debug":
+        mode_debug(a.pcc)
     print(f"\n{failures} failure(s)")
     sys.exit(min(failures, 125))
 

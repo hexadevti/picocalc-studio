@@ -18,3 +18,6 @@ void sdk_snd_reset();
 typedef void (*sdk_exit_fn)(void);
 sdk_exit_fn sdk_set_exit_handler(sdk_exit_fn fn);   // returns the previous one
 [[noreturn]] void sdk_exit();
+// Whether a Break press seen by the key pump calls sdk_exit() (the default). A debug run turns it
+// off: Break pauses the program at its next stop point instead, and the pump drops the press.
+void sdk_set_break_exits(bool on);
