@@ -27,7 +27,7 @@ static int take(size_t *off, size_t len, uint32_t n, size_t size, size_t *start)
 int pcx_parse(const void *buf, size_t len, PcxView *v, char *err, int errlen) {
   const uint8_t *b = (const uint8_t *)buf;
   const PcxHeader *h = (const PcxHeader *)buf;
-  size_t off = sizeof(PcxHeader), text, data, imports, relocs, lines, files, strtab, stops;
+  size_t off = sizeof(PcxHeader), text, data, imports, relocs, lines, files, strtab, stops, funcs;
   uint32_t i;
   memset(v, 0, sizeof *v);
   if (!buf || ((uintptr_t)buf & 3u)) return fail(err, errlen, "image buffer not 4-byte aligned", NULL);
@@ -62,6 +62,7 @@ int pcx_parse(const void *buf, size_t len, PcxView *v, char *err, int errlen) {
     const PcxDebug *d = (const PcxDebug *)(const void *)(b + off);
     off += sizeof(PcxDebug);
     if (take(&off, len, d->n_stops, 4, &stops)) goto trunc;
+    if (take(&off, len, d->n_funcs, sizeof(PcxFunc), &funcs)) goto trunc;
     if (d->flags_off < h->data_size || d->flags_off > h->data_size + h->bss_size ||
         d->n_stops > h->data_size + h->bss_size - d->flags_off)
       return fail(err, errlen, "debug flags outside the bss", NULL);
@@ -70,6 +71,13 @@ int pcx_parse(const void *buf, size_t len, PcxView *v, char *err, int errlen) {
     for (i = 0; i < d->n_stops; i++)
       if (v->stops[i] >= h->text_size || (i && v->stops[i] <= v->stops[i - 1]))
         return fail(err, errlen, "bad stop table", NULL);
+    v->funcs = (const PcxFunc *)(const void *)(b + funcs);
+    for (i = 0; i < d->n_funcs; i++) {
+      const PcxFunc *f = &v->funcs[i];
+      if (f->text_lo >= f->text_hi || f->text_hi > h->text_size || f->name >= h->strtab_size ||
+          (f->va != 0 && f->va != 32) || (i && f->text_lo < v->funcs[i - 1].text_hi))
+        return fail(err, errlen, "bad function table", NULL);
+    }
   }
 
   if ((h->entry_main != PCX_NO_ENTRY && h->entry_main >= h->text_size) ||
@@ -192,4 +200,14 @@ int pcx_stop_index(const PcxView *v, uint32_t ret_off) {
     else hi = mid;
   }
   return (int)lo - 1;
+}
+
+const PcxFunc *pcx_func_at(const PcxView *v, uint32_t text_off) {
+  uint32_t lo = 0, hi = v->dbg ? v->dbg->n_funcs : 0;
+  while (lo < hi) {  // first function ending past text_off
+    uint32_t mid = lo + (hi - lo) / 2;
+    if (v->funcs[mid].text_hi <= text_off) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < (v->dbg ? v->dbg->n_funcs : 0) && v->funcs[lo].text_lo <= text_off ? &v->funcs[lo] : NULL;
 }

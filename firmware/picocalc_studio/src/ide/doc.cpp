@@ -6,6 +6,7 @@
 #include <errno.h>
 #include "esp_heap_caps.h"
 #include "doc.h"
+#include "../sdk/picocalc.h"
 
 #define MAX_FILE (1024 * 1024)
 
@@ -508,8 +509,13 @@ static bool inList(const char *const *list, const char *s, int n) {
 
 static inline bool identChar(char c) { return isalnum((unsigned char)c) || c == '_'; }
 
-// Classifies one line (cls may be null) and returns whether it ends inside a /* comment.
-static bool scanLine(const char *s, int len, bool inComment, uint8_t *cls) {
+// Indexed by HL_*.
+const uint16_t hl_colors[] = {
+    RGB(220, 220, 220), RGB(110, 170, 255), RGB(80, 200, 180), RGB(190, 220, 160), RGB(230, 150, 110),
+    RGB(110, 150, 90),  RGB(200, 140, 200), RGB(230, 190, 90), RGB(230, 230, 160), RGB(170, 170, 180),
+};
+
+bool hl_scan(const char *s, int len, bool inComment, uint8_t *cls) {
   int i = 0;
   auto mark = [&](int from, int to, uint8_t c) {
     if (cls) memset(cls + from, c, to - from);
@@ -579,8 +585,8 @@ void doc_highlight(Doc *d, int y, uint8_t *cls) {
   if (d->hlValid < 1) { d->hl[0] = 0; d->hlValid = 1; }
   while (d->hlValid <= y) {
     const int i = d->hlValid - 1;
-    d->hl[i + 1] = scanLine(d->ln[i].s, d->ln[i].len, d->hl[i], nullptr);
+    d->hl[i + 1] = hl_scan(d->ln[i].s, d->ln[i].len, d->hl[i], nullptr);
     d->hlValid++;
   }
-  scanLine(d->ln[y].s, d->ln[y].len, d->hl[y], cls);
+  hl_scan(d->ln[y].s, d->ln[y].len, d->hl[y], cls);
 }

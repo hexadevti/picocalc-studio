@@ -2628,6 +2628,14 @@ static void emit_function(Obj *fn) {
   asm_end_function();
   sym = &out->syms[sym_idx];
   sym->size = asm_pc() - start;
+  if (cc_debug) {
+    if (out->nfuncs == out->capfuncs) {
+      int cap = out->capfuncs ? out->capfuncs * 2 : 32;
+      out->funcs = cc_grow(out->funcs, sizeof(CcFunc) * out->capfuncs, sizeof(CcFunc) * cap);
+      out->capfuncs = cap;
+    }
+    out->funcs[out->nfuncs++] = (CcFunc){start, asm_pc(), fn->name, va, save_x, save_f};
+  }
 }
 
 static bool all_zero(char *p, int n) {

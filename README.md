@@ -4,7 +4,8 @@ A C development environment that runs **on the [ClockworkPi PicoCalc](https://ww
 You write, build, run and package programs on the device itself, with no PC involved: an editor
 with completion and go-to-declaration, a C compiler that targets the board's RISC-V CPU, a runner
 that catches crashes, and an exporter that turns a program into a standalone firmware for
-[PicoMultiLoader](#installing).
+[PicoMultiLoader](https://github.com/hexadevti/PicoMultiLoader), the SD-card boot menu we recommend for
+the PicoCalc (see [Installing](#installing)).
 
 <p align="center">
   <img src="docs/screenshots/ide-editor.png" width="320" alt="The editor">
@@ -20,10 +21,32 @@ that catches crashes, and an exporter that turns a program into a standalone fir
 
 ## Boards
 
-| Board | CPU | Memory | Export | Status |
-|---|---|---|---|---|
-| PicoCalc + **ESP32-P4** module | RISC-V with FPU | PSRAM | `.bin` | main target |
-| PicoCalc + **Raspberry Pi Pico 2 W** (RP2350) | Hazard3 RISC-V, 150 MHz, soft-float | 520 KB SRAM, no PSRAM | `.uf2` | runs. The largest examples don't fit in RAM. Needs a PicoMultiLoader whose boot stub can start a RISC-V image. |
+The same firmware source builds for two modules in the PicoCalc's Pico socket. The core you build
+with picks the board (`board.h`).
+
+| | **ESP32-P4** (Waveshare ESP32-P4-WIFI6) | **Raspberry Pi Pico 2 W** (RP2350) |
+|---|---|---|
+| Role | main target, every feature tested on hardware | port. Runs on hardware but is limited by RAM. |
+| CPU | ESP32-P4: 2× RISC-V at 360 MHz (chip v1.x) or 400 MHz (v3.x), single-precision FPU | Hazard3 RISC-V at 150 MHz, no FPU |
+| `float` | hardware FPU | software (soft-float) |
+| `double` | software | software |
+| Memory | 32 MB PSRAM in the package: the framebuffer, the compiler and programs all fit with room to spare | 520 KB SRAM, no PSRAM. About 400 KB of heap after the firmware. |
+| Compiler memory | its own heap in PSRAM | borrows the 200 KB framebuffer during a build, and parks the open files to free their memory |
+| Program memory | MBs (PSRAM) | about 140 KB for code + data + a 32 KB stack + `malloc` |
+| Where compiled code runs | from flash (mapped tail of the app partition) | from SRAM (relocated in place) |
+| LCD SPI clock | 80 MHz | 37.5 MHz (F_CPU / 4): full-screen flushes take about twice as long |
+| Audio | I2S PDM into the mainboard's filter | PWM on GPIO26/27 |
+| Flash | 32 MB; the app runs from PicoMultiLoader's 10 MB app slot | 4 MB; the app area is 4088 KB after the loader's 8 KB boot stub |
+| F5 export | `.bin`, tested on hardware | `.uf2`, written but not yet tested on hardware |
+| Crash → file:line | yes, also after a reboot | live only. After a reboot it is printed on the serial port. |
+| Compiler self-test (`@test`) | all pass | all pass (the biggest test compiles in 4 s) |
+| Examples | all 19 | the small and medium ones. asteroids builds (3 s) and demoscene runs. **kart** and **starfighter** need more memory than is free. |
+| Build | `tools\build.ps1` (arduino-esp32) | `tools\build_rp2350.ps1` (arduino-pico 6.1.1, RISC-V, FreeRTOS) |
+| Loader | [PicoMultiLoader](https://github.com/hexadevti/PicoMultiLoader), as it is | [PicoMultiLoader](https://github.com/hexadevti/PicoMultiLoader) with the boot stub that can start a RISC-V image |
+
+On the Pico 2 W, memory decides what fits, not speed: a build needs the compiler's peak (up to
+about 210 KB for the larger examples), the open documents and the IDE all at once. `python
+tools/host/mem.py` measures a project's compiler peak on the PC.
 
 ## Screenshots
 
@@ -62,21 +85,74 @@ that catches crashes, and an exporter that turns a program into a standalone fir
 
 ## Installing
 
-PicoCalc Studio is an app for **PicoMultiLoader**, the PicoCalc's SD-card boot menu. Don't flash
-it with `arduino-cli upload` or esptool: on the P4 that would also overwrite the bootloader and
-partition table, and the loader with them.
+### Use PicoMultiLoader to host the PicoCalc
+
+We recommend **[PicoMultiLoader](https://github.com/hexadevti/PicoMultiLoader)** as the PicoCalc's
+firmware host. It is an SD-card boot menu for the PicoCalc: you copy apps to the microSD card,
+pick one on the LCD with the keyboard, and the loader flashes and boots it. It runs on all the
+boards PicoCalc Studio supports: the ESP32-P4 (`.bin` apps), the Pico 2 W (`.uf2` apps) and the
+RP2040 Pico.
+
+PicoCalc Studio is built to live under it:
+
+- **It is a PicoMultiLoader app.** The firmware is a plain app image that the loader writes to its
+  app slot. It never touches the bootloader or the partition table.
+- **F10 (or Shift-F5 on any screen) goes back to the loader**, through the loader's own "show the
+  menu" signal. You can also hold **Up** (or F1/F5) while switching on or resetting.
+- **F5 exports are PicoMultiLoader apps too.** An exported program is a copy of the firmware that
+  boots straight into that program. You put it in the loader menu like any other app, without a PC.
+- **The loader and Studio share the SD card.** The loader's web file manager (F4, on the Wi-Fi
+  boards) and USB drive mode (F5) can copy your projects to and from the PC.
+
+Don't flash PicoCalc Studio with `arduino-cli upload` or esptool. On the P4 that also writes the
+bootloader and partition table, which removes the loader.
+
+### 1. Install PicoMultiLoader (once)
+
+Follow the [PicoMultiLoader README](https://github.com/hexadevti/PicoMultiLoader#readme):
+
+- **ESP32-P4**: flash the loader over USB with `idf.py flash`. Build it for your chip's revision
+  (v3.x by default).
+- **Pico 2 W**: hold BOOTSEL, copy `PicoMultiLoader-rp2350.uf2` to the `RP2350` drive, then
+  copy `pml2350.uf2` to the root of the SD card. PicoCalc Studio is a **RISC-V** build, so the
+  boot stub must be able to start RISC-V images. Use a loader build that includes the RISC-V
+  boot stub.
+
+### 2. Put PicoCalc Studio on the SD card
 
 1. Build the firmware (see [Building](#building)), or take a release build:
    `picocalc_studio.bin` (ESP32-P4) or `picocalc_studio.uf2` (Pico 2 W).
-2. Copy it to the SD card where PicoMultiLoader looks for apps.
-3. Copy this repo's [`sdcard/picocalc-studio`](sdcard/picocalc-studio) folder to the root of the
+2. Copy this repo's [`sdcard/picocalc-studio`](sdcard/picocalc-studio) folder to the root of the
    SD card. It has the C headers, the SDK sources (for F9), the examples and the compiler tests.
-4. Pick PicoCalc Studio in the loader menu.
+3. Copy the firmware file into that `picocalc-studio/` folder too, keeping its name
+   (`picocalc_studio.uf2` / `picocalc_studio.bin`).
+4. In PicoMultiLoader, pick **Studio** on the Home screen and press **Enter** twice (details,
+   then flash and run). The next time you switch on, Studio starts directly.
+
+The folder is a ready-made PicoMultiLoader app (see its
+[docs/apps.md](https://github.com/hexadevti/PicoMultiLoader/blob/master/docs/apps.md)):
+`app.ini` gives Home the name, version, category and description and picks the right binary
+for the board, and `icon.bmp` is the 32×32 icon, drawn in palette roles so it follows the
+loader's theme. The P4 build also writes the name and version (`firmware/picocalc_studio/version.h`)
+into the app descriptor, which the loader's details screen shows. When you change the version,
+change it in `app.ini` too.
+
+Any other loader works the same way: it ignores `app.ini` and `icon.bmp`, so browse to
+`picocalc-studio/` and pick the firmware file there. On the Pico 2 W, "back to the menu" (F10,
+Shift-F5) uses the watchdog request that [uf2loader](https://github.com/pelrun/uf2loader) defined
+and PicoMultiLoader also uses. Without a loader, it just restarts.
+
+Apps you export with F5 go to `/picocalc-studio/apps/` by default. PicoMultiLoader's Home only
+lists folders in the root of the card, so either browse to them in Files (F2 adds one to Home as
+a favourite) or export into a top-level folder of their own, such as `/MyGame`.
 
 SD card layout:
 
 ```
 /picocalc-studio/
+  app.ini       PicoMultiLoader metadata: name, version, which binary
+  icon.bmp      PicoMultiLoader Home icon
+  picocalc_studio.uf2 / .bin   the firmware (you copy it here)
   include/      C and SDK headers (picocalc.h)
   lib/picocalc/ SDK sources, shown read-only by F9
   examples/     the examples (read-only in the IDE)

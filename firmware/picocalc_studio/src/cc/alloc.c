@@ -691,6 +691,8 @@ static CcObject *keep_object(CcObject *o) {
   }
   for (int i = 0; i < o->nfiles; i++)
     o->files[i] = cc_strdup(o->files[i]);
+  for (int i = 0; i < o->nfuncs; i++)
+    o->funcs[i].name = cc_strdup(o->funcs[i].name);
   cc_scratch_end();
   free_arena(&main_arena);
 
@@ -713,6 +715,8 @@ static CcObject *keep_object(CcObject *o) {
   k->capfiles = k->nfiles;
   k->stops = cc_grow_keep(k->stops, sizeof(uint32_t) * k->nstops);
   k->capstops = k->nstops;
+  k->funcs = cc_grow_keep(k->funcs, sizeof(CcFunc) * k->nfuncs);
+  k->capfuncs = k->nfuncs;
   free_grown();
   return k;
 }

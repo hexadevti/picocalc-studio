@@ -82,6 +82,14 @@ typedef struct {
   int nparts;
 } CcSection;
 
+// A function of a debug build: its code and frame, for the debugger's call stack (PcxFunc).
+typedef struct {
+  uint32_t lo, hi;     // text offsets: [lo, hi)
+  char *name;
+  uint32_t va;         // 32 if variadic: the register save area above the saved ra/s0
+  uint32_t save_x, save_f;  // callee-saved registers the prologue stores (bit = register)
+} CcFunc;
+
 typedef struct {
   char *path;          // main source file
   CcSection sect[CC_NSECT];
@@ -95,6 +103,8 @@ typedef struct {
   int nfiles, capfiles;
   uint32_t *stops;     // cc_debug: text offset of each stop point; its index is its flag's
   int nstops, capstops;  // offset from __dbg_flags
+  CcFunc *funcs;       // cc_debug: every function, in text order
+  int nfuncs, capfuncs;
 } CcObject;
 
 // Compiles one C file. Returns 0, or -1 with the message in cc_error().

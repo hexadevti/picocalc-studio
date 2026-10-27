@@ -1,0 +1,34 @@
+@break d03_ret.c:36
+@stop d03_ret.c:36
+@stop d03_ret.c:9
+@bt sum d03_ret.c:9
+@bt main d03_ret.c:36
+@return d03_ret.c:36
+@stop d03_ret.c:37
+s=10
+@stop d03_ret.c:38
+@stop d03_ret.c:18
+@return d03_ret.c:38
+@stop d03_ret.c:39
+h=2.50
+@stop d03_ret.c:40
+@stop d03_ret.c:22
+@return d03_ret.c:40
+@stop d03_ret.c:41
+b=3298534883328
+@stop d03_ret.c:42
+@stop d03_ret.c:26
+@stop d03_ret.c:27
+@return d03_ret.c:42
+@stop d03_ret.c:43
+@break d03_ret.c:13
+t=7 14 21
+@stop d03_ret.c:13
+@bt sum d03_ret.c:13
+@bt outer d03_ret.c:31
+@bt main d03_ret.c:44
+@stop d03_ret.c:14
+@return d03_ret.c:31
+@stop d03_ret.c:32
+@return d03_ret.c:44
+o=7

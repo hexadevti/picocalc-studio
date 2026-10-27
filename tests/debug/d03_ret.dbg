@@ -1,0 +1,27 @@
+break d03_ret.c:36
+run
+step        # into sum: a variadic frame
+bt          # sum, main
+finish      # back in main with s
+next
+next
+step        # into half
+finish      # a float return
+next
+next
+step        # into big
+finish      # a long long return
+next
+next
+step        # into tri
+next
+finish      # a struct return
+next
+break d03_ret.c:13
+continue    # in sum, called from outer
+bt          # sum, outer, main
+next
+next        # sum returns into outer
+next
+next        # outer returns into main
+continue

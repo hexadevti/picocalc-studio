@@ -52,9 +52,10 @@ both boards. Debug builds are the only ones that pay for it.
 
 The tables go in an optional trailer after the string table (4-byte aligned), so `PCX_VERSION`
 stays 1 and a non-debug image is byte-for-byte what it was. The loader (`pcx_parse`) checks it and
-sets `PcxView.dbg`/`.stops`. Done so far: a `PcxDebug` header (`"PCXD"`, `n_stops`, `flags_off` =
-the offset of `__dbg_flags` in the ram block) and the stops as ascending text offsets; their line
-comes from the existing line table. The rest of the table below is still to do.
+sets `PcxView.dbg`/`.stops`/`.funcs`. Done so far: a `PcxDebug` header (`"PCXD"`, `n_stops`,
+`flags_off` = the offset of `__dbg_flags` in the ram block, `n_funcs`), the stops as ascending text
+offsets (their line comes from the existing line table), then the funcs as `PcxFunc` entries,
+ascending, with their names in the string table. vars and types are still to do.
 
 | table | entry | used for |
 |---|---|---|
@@ -95,11 +96,21 @@ mode PAUSE     : stop at once
 A breakpoint is set on the **first** stop of its line only: `int b = f(a);` has two (the
 declaration and its initializer), and stepping already treats a line as one place.
 
-Known limit of `finish` (and of `next` off a `return`): every callee of one function shares one
-`s0`, so when the caller has no stop left after the call (`return f(n-1) + f(n-2);`), the stop is
-in the next call it makes at that depth, not in the caller. The fix is a return breakpoint: patch
-the frame's saved ra (`s0 - va - 4`) to a firmware stub that stops at the return site. It needs
-`va`, which comes with the funcs table (step 3).
+Every callee of one function shares one `s0` (the caller's sp), so a stop point alone can't
+tell that a stepped function returned: with no stop left in the caller after the call
+(`return f(n-1) + f(n-2);`), `finish` would stop in the next call at that depth. So **any step
+also catches the return** of the frame it starts in: `pcx_dbg_resume` saves the frame's real ra
+(`s0 - va - 4`, `va` from the funcs entry) in a 16-entry list and patches the slot to
+`pcx_dbg_ret_tramp` (rt/pcx_dbg_ret.S). The function returns there with the caller's registers;
+the trampoline saves them like the stop stub and calls `__pc_dbg_return`, which puts the real ra in
+`x[5]` and decides (`pcx_dbg_return`): stop (shown as "return", at the return site, on the call's
+line) if the returning frame is the stepped one (`next`/`step`/`finish`) or a pause is pending.
+The trampoline then jumps to `x[5]`. The list entry is keyed by `s0`; a return also drops entries
+below it (frames a longjmp skipped), and the backtrace reads through patched slots. Not caught:
+main's return (its ra is in the firmware), so `finish` in main runs to the end.
+
+A place in the program is a text offset inside its line: a stop point's offset, or a return
+address minus 1. The stopped view, the backtrace and `pcx_dbg_resume` all take places.
 
 For any mode other than RUN, all flags are set to 1 (memset), and the stop handler filters. The
 stack grows down, so a caller frame has a higher `s0`, and recursion works without extra state.
@@ -111,9 +122,10 @@ the press instead of ending the program. A second Break before the program reach
 in a firmware call, or in code built without stops) ends it the usual way: Break exits again,
 the breakpoints go, and the 500 ms kill stays as the last resort.
 
-Call stack: start from the stopped `s0`/`pc`. A frame's saved ra is at `s0 - va - 4` and the saved
-s0 is at `s0 - va - 8`, with `va` taken from the funcs entry. Stop at an address outside the image
-text. A caller's register variables come from the callee's save area (`s0 - va - 12 - 4k`, in
+Call stack (`pcx_dbg_backtrace`, done): start from the stopped place and `s0`. A frame's saved ra
+is at `s0 - va - 4` and the saved s0 is at `s0 - va - 8`, with `va` taken from the funcs entry.
+Stop at an address outside the image text (main's caller is the firmware). Still to do, with the
+locals: a caller's register variables come from the callee's save area (`s0 - va - 12 - 4k`, in
 save-mask order), exactly as the epilogue reloads them.
 
 ## 4. Screen and keys while stopped
@@ -127,11 +139,14 @@ save-mask order), exactly as the epilogue reloads them.
   lines around the stop from the saved file on the SD card. Debug runs require saved files, as
   F3/F4 already do.
 
-Stopped view (rt/debugger.cpp, 6x10 font = 53x32 cells). Step 2 has a title bar (file:line and
-why it stopped: breakpoint, step, paused), 29 source lines with the current line a third of the
-way down and highlighted, `*` marks on breakpoint lines, and a key line. It draws a few cells at a
-time from a stack buffer and reads the source line by line, so it needs no heap. Later: the call
-stack (3-4 frames), then the watches and the locals of the selected frame. Keys (step 2 also takes
+Stopped view (rt/debugger.cpp, 6x10 font = 53x32 cells): a title bar (file:line and why it
+stopped: breakpoint, step, return, paused; or the selected frame's number), 20 source lines with
+the current line a third of the way down and highlighted, colored like the editor (doc.cpp's
+`hl_scan`), `*` marks on breakpoint lines, the call
+stack (a title bar and 9 frame rows, `#N function file:line`, innermost first, scrolling to the
+selected frame; up to 32 frames), and a key line. PgUp/PgDn select a frame, and the source shows
+its line. It draws a few cells at a time from a stack buffer and reads the source line by line, so
+it needs no heap. Later: the watches and the locals of the selected frame. Keys (it also takes
 c/n/s/f/q):
 
 | key | action |
@@ -140,7 +155,7 @@ c/n/s/f/q):
 | Down | step over |
 | Right | step into |
 | Left | step out |
-| Up/Down with Shift (or Alt, see the Shift note) | select a frame |
+| PgUp / PgDn | select a frame (inward / outward) |
 | Tab | locals / watches pane; Enter expands a struct or array |
 | W | add a watch (a name; expressions come later) |
 | Esc / Break | stop the program |
@@ -186,10 +201,12 @@ Not handled yet: sound keeps playing while the program is stopped.
    ```
 
    `--dbg trace` also prints `stop file:line` on stderr for each stop.
-2. **Script tests (done for stepping):** `pcxrun --dbg SCRIPT` runs tests/debug/NAME.dbg, with
-   `break`/`delete FILE:LINE`, `run`/`continue`, `next`, `step`, `finish` (`print x` and `bt`
-   come with steps 3-4). It prints `@break`/`@stop FILE:LINE` lines between the program's output,
-   checked against NAME.expected:
+2. **Script tests (done for stepping and the call stack):** `pcxrun --dbg SCRIPT` runs
+   tests/debug/NAME.dbg, with `break`/`delete FILE:LINE`, `run`/`continue`, `next`, `step`,
+   `finish`, `bt` (`print x` comes with step 4). It prints `@break`/`@stop`/`@return FILE:LINE`
+   lines (and `@bt FUNC FILE:LINE` per frame) between the program's output, checked against
+   NAME.expected. d03_ret checks that values come back through the trampoline (int, float,
+   long long, a struct, a variadic function):
 
    ```
    run_tests.py debug --pcc "build/host/pcc.exe -g {src} -o {out}"
@@ -200,9 +217,9 @@ Not handled yet: sound keeps playing while the program is stopped.
 
 1. ~~Codegen stop points + stops table + `-g` in pcc; simfw handler; transparency test.~~ Done.
 2. ~~runner.cpp stop/resume protocol, PAUSE on Break, minimal stopped view (source + current line,
-   continue/step/stop). IDE: Ctrl-B, Ctrl-F4.~~ Written, host tests pass, both firmwares build.
-   *First hardware test: next.*
-3. funcs table + call stack.
+   continue/step/stop). IDE: Ctrl-B, Ctrl-F4.~~ Done, tested on hardware.
+3. ~~funcs table + call stack, return trampoline for finish.~~ Written, host tests pass, both
+   firmwares build. *Hardware test: next.*
 4. vars/types tables + locals, globals and the watch list.
 5. Live globals while running (the overlay strip).
 6. Later: watch expressions and conditional breakpoints (reuse the parser's expression code and

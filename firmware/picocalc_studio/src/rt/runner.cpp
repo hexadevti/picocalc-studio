@@ -51,7 +51,8 @@ static struct {
   bool debug;
   PcxDbg dbg;
   PcxDbgRegs *stopRegs;
-  int stopId;
+  uint32_t stopAt;       // the place (pcx.h) the program is stopped at
+  const char *stopWhy;
   bool killReq;          // the stopped view ended the program
   bool pausing;          // Break asked for a pause the program hasn't reached yet
   SemaphoreHandle_t resume;
@@ -86,30 +87,48 @@ static void sdkExitHandler() {
   s_prevExit();
 }
 
-// A debug build's stop point whose flag is set (docs/DEBUGGER.md), on the program task: hands the
-// stop to the supervisor and waits for its command.
-extern "C" void __pc_dbg_stop(PcxDbgRegs *regs) {
-  if (!g.debug || !inProgram()) return;
-  const int id = pcx_stop_index(&g.mod->view, regs->x[5] - (uint32_t)(uintptr_t)g.mod->text);
-  if (!pcx_dbg_check(&g.dbg, id, regs->x[8])) return;
+// On the program task: hands a stop to the supervisor and waits for its command.
+static void stopHere(PcxDbgRegs *regs, uint32_t at, const char *why) {
   g.stopRegs = regs;
-  g.stopId = id;
+  g.stopAt = at;
+  g.stopWhy = why;
   xTaskNotify(g.supervisor, BIT_STOP, eSetBits);
   xSemaphoreTake(g.resume, portMAX_DELAY);
   if (g.killReq) endProgram(RT_END_BREAK, 0);
 }
 
+// A debug build's stop point whose flag is set (docs/DEBUGGER.md).
+extern "C" void __pc_dbg_stop(PcxDbgRegs *regs) {
+  if (!g.debug || !inProgram()) return;
+  const int id = pcx_stop_index(&g.mod->view, regs->x[5] - (uint32_t)(uintptr_t)g.mod->text);
+  if (!pcx_dbg_check(&g.dbg, id, regs->x[8])) return;
+  stopHere(regs, g.mod->view.stops[id],
+           g.dbg.bp[id] ? "breakpoint" : g.dbg.mode == PCX_DBG_PAUSE ? "paused" : "step");
+}
+
+// A stepped function returning through pcx_dbg_ret_tramp: it always needs its real return address,
+// even once the run is no longer stepping.
+extern "C" void __pc_dbg_return(PcxDbgRegs *regs) {
+  const int r = pcx_dbg_return(&g.dbg, regs);
+  if (r < 0) {
+    hal_log("debug: return from a frame the debugger never patched");
+    if (inProgram()) endProgram(RT_END_ABORT, 134);
+    abort();
+  }
+  if (!r || !g.debug || !inProgram()) return;
+  stopHere(regs, regs->x[5] - (uint32_t)(uintptr_t)g.mod->text - 1,
+           g.dbg.mode == PCX_DBG_PAUSE ? "paused" : "return");
+}
+
 // The supervisor's side of a stop: the stopped view, then the program goes on as it says.
 static void onStop() {
   g.pausing = false;
-  const int id = g.stopId;
-  const char *why = g.dbg.bp[id] ? "breakpoint" : g.dbg.mode == PCX_DBG_PAUSE ? "paused" : "step";
-  const int mode = rt_dbg_view(g.mod, &g.dbg, id, g.stopRegs, why);
+  const int mode = rt_dbg_view(g.mod, &g.dbg, g.stopAt, g.stopRegs, g.stopWhy);
   // Break pressed in the view was the view's key, not a pause.
   ulTaskNotifyValueClear(nullptr, BIT_BREAK);
   g.breakReq = false;
   if (mode < 0) g.killReq = true;
-  else pcx_dbg_resume(&g.dbg, mode, id, g.stopRegs->x[8]);
+  else pcx_dbg_resume(&g.dbg, mode, g.stopAt, g.stopRegs->x[8]);
   xSemaphoreGive(g.resume);
 }
 
@@ -121,7 +140,7 @@ static bool debugStart(RtModule *m, const RtRunOptions *opt) {
   if (!g.resume && !(g.resume = xSemaphoreCreateBinary())) return false;
   uint8_t *bp = (uint8_t *)malloc(d->n_stops);
   if (!bp) return false;
-  pcx_dbg_init(&g.dbg, &m->view, m->ram, bp);
+  pcx_dbg_init(&g.dbg, &m->view, (uint32_t)(uintptr_t)m->text, m->ram, bp);
   for (int i = 0; i < opt->nbreakpoints; i++)
     if (!pcx_dbg_break(&g.dbg, opt->breakpoints[i].file, opt->breakpoints[i].line, 1))
       hal_log("debug: no code at or after %s:%d", opt->breakpoints[i].file, opt->breakpoints[i].line);
@@ -405,7 +424,7 @@ static int runImage(const void *image, size_t size, const RtRunOptions *opt, RtR
       if (g.debug) {
         sdk_set_break_exits(true);
         memset(g.dbg.bp, 0, g.dbg.n);   // and no more stops
-        pcx_dbg_resume(&g.dbg, PCX_DBG_RUN, -1, 0);
+        pcx_dbg_resume(&g.dbg, PCX_DBG_RUN, UINT32_MAX, 0);
       }
       // The program's next kbd/sys call sees the queued Break and exits through sdkExitHandler.
       const uint32_t until = hal_millis() + BREAK_GRACE_MS;

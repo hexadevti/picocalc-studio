@@ -2,12 +2,15 @@ break d01_step.c:17
 run
 step        # into sq
 next
-next        # back out to main
+next        # sq returns: back in main, still on its line
+next
 next
 step        # into fact(3)
 next
 step        # into fact(2): the same line, a deeper frame
-finish      # out to main: fact(3) has no stop left after the call
+bt          # fact(2), fact(3), main
+finish      # back in fact(3), at the call
+finish      # back in main
 break d01_step.c:22
 continue
 continue

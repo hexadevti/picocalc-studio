@@ -21,9 +21,11 @@
  *   break FILE:LINE / delete FILE:LINE   set / clear a breakpoint ("@break FILE:LINE" on stdout)
  *   run, continue                        run to the next breakpoint
  *   next, step, finish                   step over / into / out
- * Commands up to the first run command apply before the program starts; then one runs at each
- * stop, which prints "@stop FILE:LINE" on stdout, between the program's output. Out of commands,
- * the program runs to the end with its breakpoints off.
+ *   bt                                   the call stack: "@bt FUNC FILE:LINE" per frame
+ * Commands up to the first run command apply before the program starts; then they run at each
+ * stop, which prints "@stop FILE:LINE" on stdout, between the program's output (a stop where a
+ * stepped function returned to its caller prints "@return FILE:LINE"). Out of commands, the
+ * program runs to the end with its breakpoints off.
  */
 #include <malloc.h>
 #include <stdint.h>
@@ -58,6 +60,7 @@ static int s_trace;
 static unsigned long s_nstops;
 static FILE *s_script;
 static PcxDbg s_dbg;
+static uint32_t s_at, s_s0;   /* where the program is stopped (bt) */
 
 static void die(const char *msg, const char *arg);
 
@@ -81,6 +84,17 @@ static int script_commands(void)
         if (!strcmp(c, "next")) return PCX_DBG_STEP_OVER;
         if (!strcmp(c, "step")) return PCX_DBG_STEP_INTO;
         if (!strcmp(c, "finish")) return PCX_DBG_STEP_OUT;
+        if (!strcmp(c, "bt")) {
+            PcxFrame f[16];
+            int nf = pcx_dbg_backtrace(&s_dbg, s_at, s_s0, f, 16);
+            for (int k = 0; k < nf; k++) {
+                const char *file = "?";
+                int l = 0;
+                pcx_lookup_line(&s_view, f[k].at, &file, &l);
+                printf("@bt %s %s:%d\n", f[k].fn ? s_view.strtab + f[k].fn->name : "?", base_name(file), l);
+            }
+            continue;
+        }
         int on = !strncmp(c, "break ", 6);
         if ((on || !strncmp(c, "delete ", 7)) && sscanf(c + (on ? 6 : 7), "%127[^:]:%d", file, &n) == 2) {
             int at = pcx_dbg_break(&s_dbg, file, n, on);
@@ -108,7 +122,9 @@ void __pc_dbg_stop(PcxDbgRegs *regs)
         if (!pcx_dbg_check(&s_dbg, i, regs->x[8])) return;
         if (!pcx_lookup_line(&s_view, s_view.stops[i], &file, &line)) die("stop without a line%s", "");
         printf("@stop %s:%d\n", base_name(file), line);
-        pcx_dbg_resume(&s_dbg, script_commands(), i, regs->x[8]);
+        s_at = s_view.stops[i];
+        s_s0 = regs->x[8];
+        pcx_dbg_resume(&s_dbg, script_commands(), s_at, s_s0);
         return;
     }
     s_nstops++;
@@ -120,6 +136,20 @@ void __pc_dbg_stop(PcxDbgRegs *regs)
         else
             fprintf(stderr, "stop %u\n", (unsigned)i);
     }
+}
+
+void __pc_dbg_return(PcxDbgRegs *regs)
+{
+    const char *file;
+    int line;
+    int r = pcx_dbg_return(&s_dbg, regs);
+    if (r < 0) die("return through the trampoline from an unknown frame%s", "");
+    if (!r) return;
+    s_at = regs->x[5] - s_text - 1;
+    s_s0 = regs->x[8];
+    if (!pcx_lookup_line(&s_view, s_at, &file, &line)) die("return without a line%s", "");
+    printf("@return %s:%d\n", base_name(file), line);
+    pcx_dbg_resume(&s_dbg, script_commands(), s_at, s_s0);
 }
 
 static void report_stops(void)
@@ -179,8 +209,8 @@ int main(int argc, char **argv)
         } else {
             uint8_t *bp = malloc(v.dbg->n_stops ? v.dbg->n_stops : 1);
             if (!bp || !(s_script = fopen(dbg, "r"))) die("cannot open %s", dbg);
-            pcx_dbg_init(&s_dbg, &s_view, ram, bp);
-            pcx_dbg_resume(&s_dbg, script_commands(), -1, 0);
+            pcx_dbg_init(&s_dbg, &s_view, s_text, ram, bp);
+            pcx_dbg_resume(&s_dbg, script_commands(), UINT32_MAX, 0);
         }
     }
 

@@ -12,12 +12,6 @@
 #define ERR_BG    RGB(100, 20, 24)
 #define SEL_BG    RGB(50, 80, 150)
 
-// Indexed by HL_*.
-static const color_t kColors[] = {
-    RGB(220, 220, 220), RGB(110, 170, 255), RGB(80, 200, 180), RGB(190, 220, 160), RGB(230, 150, 110),
-    RGB(110, 150, 90),  RGB(200, 140, 200), RGB(230, 190, 90), RGB(230, 230, 160), RGB(170, 170, 180),
-};
-
 static char *s_clip;       // clipboard, shared by all files
 static int s_clipLen;
 static bool s_clipLines;   // whole lines (copied without a selection): paste above the cursor line
@@ -94,7 +88,7 @@ void ed_draw(Doc *d, int y0, int rows, int errLine) {
       int n = 0;
       while (x + n < end && cls[x + n] == c) { buf[n] = l->s[x + n]; n++; }
       buf[n] = 0;
-      gfx_text(ED_X0 + (x - d->left) * UI_CW, y, buf, kColors[c]);
+      gfx_text(ED_X0 + (x - d->left) * UI_CW, y, buf, hl_colors[c]);
       x += n;
     }
   }

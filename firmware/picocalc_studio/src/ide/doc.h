@@ -83,3 +83,8 @@ int doc_indent(const Doc *d, int y);
 enum { HL_TEXT, HL_KEYWORD, HL_TYPE, HL_NUMBER, HL_STRING, HL_COMMENT, HL_PREPROC, HL_CONST, HL_FUNC, HL_PUNCT };
 // Fills cls[0..len) for line y (which must exist).
 void doc_highlight(Doc *d, int y, uint8_t *cls);
+// Classifies len characters of one line into cls (may be null), given whether the line starts
+// inside a /* comment; returns whether it ends inside one. For text outside a Doc (the debugger).
+bool hl_scan(const char *s, int len, bool inComment, uint8_t *cls);
+// The editor's RGB565 color of each HL_* class.
+extern const uint16_t hl_colors[];

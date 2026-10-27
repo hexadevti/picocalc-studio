@@ -22,6 +22,7 @@
 #include "../cc/cc.h"
 #include "../demo/demo.h"
 #include "../export/export.h"
+#include "../../version.h"
 
 extern "C" char *cc_normpath(char *path);   // cc/alloc.c
 
@@ -982,7 +983,7 @@ static void pickFile() {
 }
 
 static const char kHelp[] =
-    "PicoCalc Studio\n"
+    PCS_NAME " " PCS_VERSION "\n"
     "\n"
     "F1   this help\n"
     "F2   mark mode on/off (select with the arrows)\n"

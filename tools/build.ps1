@@ -55,6 +55,17 @@ if ($rc -ne 0) { exit $rc }
 New-Item -ItemType Directory -Force $outDir | Out-Null
 Copy-Item (Join-Path $buildPath "$name.ino.bin") (Join-Path $outDir "$outName.bin")
 Copy-Item (Join-Path $buildPath "$name.ino.elf") (Join-Path $outDir "$outName.elf")
+
+# The app descriptor says "arduino-lib-builder" and the core's git hash. PicoMultiLoader's details
+# screen shows it, so put the app's own name and version (version.h) there.
+$versionH = Join-Path $sketchDir "version.h"
+if (Test-Path $versionH) {
+    $h = Get-Content $versionH -Raw
+    $appName = if ($Project) { $Project } elseif ($h -match '#define\s+PCS_NAME\s+"([^"]*)"') { $Matches[1] } else { $name }
+    $appVer = if ($h -match '#define\s+PCS_VERSION\s+"([^"]*)"') { $Matches[1] } else { "" }
+    python (Join-Path $repo "tools\host\esp_image.py") stamp (Join-Path $outDir "$outName.bin") --name $appName --version $appVer
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 python (Join-Path $repo "tools\host\esp_image.py") info (Join-Path $outDir "$outName.bin")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

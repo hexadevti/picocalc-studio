@@ -317,11 +317,22 @@ int cc_link(CcObject **objv, int n, const CcOptions *opt, uint8_t **image, size_
 
   Buf dbg = {0};
   if (nstops) {
-    PcxDebug d = {PCX_DEBUG_MAGIC, nstops, flags_off};
+    uint32_t nfuncs = 0;
+    for (int i = 0; i < n; i++)
+      nfuncs += objs[i]->nfuncs;
+    PcxDebug d = {PCX_DEBUG_MAGIC, nstops, flags_off, nfuncs};
     buf_put(&dbg, &d, sizeof(d));
     for (int i = 0; i < n; i++)
       for (int k = 0; k < objs[i]->nstops; k++)
         buf_u32(&dbg, sect_base[i][CC_TEXT] + objs[i]->stops[k]);
+    for (int i = 0; i < n; i++)
+      for (int k = 0; k < objs[i]->nfuncs; k++) {
+        CcFunc *f = &objs[i]->funcs[k];
+        PcxFunc pf = {sect_base[i][CC_TEXT] + f->lo, sect_base[i][CC_TEXT] + f->hi, strtab.size,
+                      f->va, f->save_x, f->save_f};
+        buf_put(&strtab, f->name, strlen(f->name) + 1);
+        buf_put(&dbg, &pf, sizeof(pf));
+      }
   }
 
   // 6. Output

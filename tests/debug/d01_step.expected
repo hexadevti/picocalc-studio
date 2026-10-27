@@ -2,13 +2,18 @@
 @stop d01_step.c:17
 @stop d01_step.c:5
 @stop d01_step.c:6
+@return d01_step.c:17
 @stop d01_step.c:18
 b=9
 @stop d01_step.c:19
 @stop d01_step.c:10
 @stop d01_step.c:12
 @stop d01_step.c:10
-@stop d01_step.c:20
+@bt fact d01_step.c:10
+@bt fact d01_step.c:12
+@bt main d01_step.c:19
+@return d01_step.c:12
+@return d01_step.c:19
 @break d01_step.c:22
 f=6
 @stop d01_step.c:22

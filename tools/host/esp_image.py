@@ -12,6 +12,8 @@ accept it.
   esp_image.py patch <image.bin> --vaddr 0x... --data <blob> -o <out.bin>
   esp_image.py export <image.bin> --elf <app.elf> --pcx <prog.pcx> --name <n> -o <out.bin>
         what the IDE's F5 does: the .pcx in the pc_slot export slot, project_name set
+  esp_image.py stamp <image.bin> [--name <n>] [--version <v>] [-o <out.bin>]
+        set the app descriptor's project_name / version (PicoMultiLoader's details screen)
 """
 import argparse
 import hashlib
@@ -28,6 +30,7 @@ SLOT_VERSION = 2          # src/export/image.h: SlotHeader, 64 bytes, then the .
 SLOT_SIZE = 256 * 1024
 SLOT_AUTORUN = 1
 APP_DESC_MAGIC = 0xABCD5432
+APP_DESC_VERSION = 16     # offsetof(esp_app_desc_t, version), 32 bytes
 APP_DESC_NAME = 48        # offsetof(esp_app_desc_t, project_name), 32 bytes
 PROBE_V1 = [
     0xff010113, 0x00112623, 0x00812423, 0x00060413, 0x000580e7,
@@ -122,6 +125,10 @@ def cmd_info(a):
     ok_c = img.compute_checksum() == img.checksum
     ok_h = (not img.hash_appended) or hashlib.sha256(img.build()[:img.body_len]).digest() == img.stored_hash
     print(f"checksum 0x{img.checksum:02x} {'valid' if ok_c else 'INVALID'}, sha256 {'valid' if ok_h else 'INVALID'}")
+    for _, seg, _ in img.segments:
+        if struct.unpack_from("<I", seg)[0] == APP_DESC_MAGIC:
+            field = lambda o: bytes(seg[o:o + 32]).split(b"\0")[0].decode(errors="replace")
+            print(f"app descriptor: name {field(APP_DESC_NAME)!r}, version {field(APP_DESC_VERSION)!r}")
     return 0 if ok_c and ok_h else 1
 
 
@@ -155,6 +162,21 @@ def cmd_patch(a):
     return 0
 
 
+def cmd_stamp(a):
+    img = Image(open(a.image, "rb").read())
+    for _, seg, _ in img.segments:
+        if struct.unpack_from("<I", seg)[0] == APP_DESC_MAGIC:
+            if a.version:
+                seg[APP_DESC_VERSION:APP_DESC_VERSION + 32] = a.version.encode()[:31].ljust(32, b"\0")
+            if a.name:
+                seg[APP_DESC_NAME:APP_DESC_NAME + 32] = a.name.encode()[:31].ljust(32, b"\0")
+            open(a.out or a.image, "wb").write(img.build())
+            print(f"app descriptor: name {a.name!r}, version {a.version!r}")
+            return 0
+    print("no app descriptor found")
+    return 1
+
+
 def cmd_export(a):
     img = Image(open(a.image, "rb").read())
     pcx = open(a.pcx, "rb").read()
@@ -185,6 +207,8 @@ def main():
     s = sub.add_parser("export"); s.add_argument("image"); s.add_argument("--elf", required=True)
     s.add_argument("--pcx", required=True); s.add_argument("--name", required=True)
     s.add_argument("-o", "--out", required=True); s.set_defaults(fn=cmd_export)
+    s = sub.add_parser("stamp"); s.add_argument("image"); s.add_argument("--name"); s.add_argument("--version")
+    s.add_argument("-o", "--out"); s.set_defaults(fn=cmd_stamp)
     a = p.parse_args()
     sys.exit(a.fn(a))
 
